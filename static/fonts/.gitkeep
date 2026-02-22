@@ -1,0 +1,8 @@
+<div class="negozio">
+    <h2 id="nomeNegozio">Nome del Negozio</h2>
+    <p id="indirizzoNegozio">Indirizzo del Negozio</p>
+    <p id="orariNegozio">Orari di Apertura</p>
+    <a id="whatsappLink" href="https://wa.me/1234567890?text=Ciao%20vorrei%20informazioni" target="_blank">
+        Chatta con noi su WhatsApp
+    </a>
+</div>

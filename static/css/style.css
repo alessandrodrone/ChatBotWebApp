@@ -1,0 +1,22 @@
+/* style.css – Stili globali RispondiTu */
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #1a1a2e;
+    color: #f0f0f0;
+}
+
+a {
+    color: #e94560;
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
