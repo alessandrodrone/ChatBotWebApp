@@ -101,7 +101,7 @@ def create_app():
                             headers = list(records[0].keys())
                             checks["shops_headers"] = f"📋 Colonne: {headers}"
                             # Mostra i primi shop trovati
-                            shop_ids = [str(r.get("id", "")).strip() for r in records if str(r.get("id", "")).strip()]
+                            shop_ids = [str(r.get("shop_id", r.get("id", ""))).strip() for r in records if str(r.get("shop_id", r.get("id", ""))).strip()]
                             checks["shop_ids"] = f"🏪 Shop IDs trovati: {shop_ids}"
                             # Mostra dettagli di ogni negozio
                             for idx, r in enumerate(records):

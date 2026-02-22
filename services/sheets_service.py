@@ -62,14 +62,22 @@ def get_all_shops() -> dict:
         records = sheet.get_all_records()
         _shops_cache = {}
         for row in records:
-            sid = str(row.get("id", "")).strip()
+            # Il foglio usa "shop_id" come colonna chiave
+            sid = str(row.get("shop_id", "")).strip()
             if sid:
                 _shops_cache[sid] = {
                     "id": sid,
                     "name": row.get("name", ""),
+                    "whatsapp_number": str(row.get("whatsapp_number", "")),
+                    "phone": str(row.get("whatsapp_number", "")),
+                    "phone_number_id": str(row.get("phone_number_id", "")),
+                    "owner_phone": str(row.get("owner_phone", "")),
+                    "timezone": row.get("timezone", "Europe/Rome"),
+                    "slot_minutes": int(row.get("slot_minutes", 30) or 30),
+                    "info": row.get("info", ""),
+                    # Campi opzionali per la landing page
                     "address": row.get("address", ""),
                     "description": row.get("description", ""),
-                    "phone": str(row.get("phone", "")),
                     "color": row.get("color", "#1a1a2e"),
                     "accent": row.get("accent", "#e94560"),
                 }
