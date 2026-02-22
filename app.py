@@ -41,6 +41,102 @@ def create_app():
             '</div>'
         )
 
+    # ── Diagnostica Google Sheets (TEMPORANEO – rimuovere dopo il test) ──
+    @app.route("/debug/sheets")
+    def debug_sheets():
+        import json as _json
+        checks = {}
+
+        # 1. Variabile GOOGLE_SERVICE_ACCOUNT_JSON
+        creds_raw = app.config.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        if not creds_raw:
+            checks["GOOGLE_SERVICE_ACCOUNT_JSON"] = "❌ MANCANTE – la variabile è vuota"
+        else:
+            checks["GOOGLE_SERVICE_ACCOUNT_JSON"] = f"✅ presente ({len(creds_raw)} caratteri)"
+            # Prova a parsare il JSON
+            try:
+                creds_dict = _json.loads(creds_raw)
+                checks["JSON_parse"] = "✅ JSON valido"
+                checks["service_account_email"] = creds_dict.get("client_email", "⚠️ campo client_email mancante")
+                checks["project_id"] = creds_dict.get("project_id", "⚠️ campo project_id mancante")
+            except _json.JSONDecodeError as e:
+                checks["JSON_parse"] = f"❌ JSON NON VALIDO: {e}"
+
+        # 2. Variabile GOOGLE_SHEET_ID
+        sheet_id = app.config.get("GOOGLE_SHEET_ID", "")
+        if not sheet_id:
+            checks["GOOGLE_SHEET_ID"] = "❌ MANCANTE – la variabile è vuota"
+        else:
+            checks["GOOGLE_SHEET_ID"] = f"✅ {sheet_id}"
+
+        # 3. Prova la connessione a Google Sheets
+        if creds_raw and sheet_id:
+            try:
+                import gspread
+                from google.oauth2.service_account import Credentials
+                creds_dict = _json.loads(creds_raw)
+                scopes = [
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive",
+                ]
+                credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+                gc = gspread.authorize(credentials)
+                checks["gspread_auth"] = "✅ Autenticazione riuscita"
+
+                # 4. Apri lo spreadsheet
+                try:
+                    spreadsheet = gc.open_by_key(sheet_id)
+                    checks["spreadsheet_open"] = f"✅ Spreadsheet aperto: '{spreadsheet.title}'"
+
+                    # 5. Lista fogli disponibili
+                    worksheets = [ws.title for ws in spreadsheet.worksheets()]
+                    checks["worksheets"] = f"📋 Fogli trovati: {worksheets}"
+
+                    # 6. Prova a leggere il foglio "shops"
+                    if "shops" in worksheets:
+                        ws = spreadsheet.worksheet("shops")
+                        records = ws.get_all_records()
+                        checks["shops_sheet"] = f"✅ Foglio 'shops' trovato – {len(records)} righe"
+                        if records:
+                            headers = list(records[0].keys())
+                            checks["shops_headers"] = f"📋 Colonne: {headers}"
+                            # Mostra i primi shop trovati
+                            shop_ids = [str(r.get("id", "")).strip() for r in records if str(r.get("id", "")).strip()]
+                            checks["shop_ids"] = f"🏪 Shop IDs trovati: {shop_ids}"
+                        else:
+                            checks["shops_data"] = "⚠️ Il foglio 'shops' è vuoto (nessuna riga dati)"
+                    else:
+                        checks["shops_sheet"] = f"❌ Foglio 'shops' NON trovato! Fogli disponibili: {worksheets}"
+
+                except Exception as e:
+                    checks["spreadsheet_open"] = f"❌ Errore apertura spreadsheet: {e}"
+
+            except ImportError as e:
+                checks["gspread_auth"] = f"❌ Libreria mancante: {e}"
+            except Exception as e:
+                checks["gspread_auth"] = f"❌ Errore autenticazione: {e}"
+
+        # 4. Invalida la cache per forzare il refresh
+        from services.sheets_service import invalidate_shops_cache
+        invalidate_shops_cache()
+        checks["cache"] = "🔄 Cache invalidata"
+
+        # Genera HTML
+        html = (
+            '<div style="font-family:monospace;max-width:700px;margin:40px auto;padding:24px;'
+            'background:#1a1a2e;color:#eee;border-radius:12px">'
+            '<h2 style="color:#e94560">🔧 Diagnostica Google Sheets</h2>'
+        )
+        for key, val in checks.items():
+            color = "#4caf50" if "✅" in str(val) else "#ff5252" if "❌" in str(val) else "#ffc107"
+            html += f'<p style="margin:8px 0"><strong style="color:{color}">{key}:</strong> {val}</p>'
+        html += (
+            '<hr style="border-color:#333;margin:20px 0">'
+            '<p style="color:#999;font-size:12px">⚠️ Rimuovi questo endpoint dopo il debug!</p>'
+            '</div>'
+        )
+        return html
+
     # ── 404 handler ───────────────────────────────────────────
     @app.errorhandler(404)
     def page_not_found(e):
