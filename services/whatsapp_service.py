@@ -159,7 +159,7 @@ def send_list_message(
 
 def notify_owner(shop: dict, message: str, phone_number_id: str):
     """Invia una notifica al proprietario dello shop (se abilitato)."""
-    if not current_app.config.get("ENABLE_OWNER_NOTIFY"):
+    if not current_app.config.get("ENABLE_OWNER_NOTIFY", True):
         return
     from utils.helpers import norm_phone
     owner = norm_phone(shop.get("owner_phone", "") or "")
