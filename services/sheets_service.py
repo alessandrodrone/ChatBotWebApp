@@ -5,6 +5,7 @@ Se le credenziali Google non sono configurate, usa i DEMO_SHOPS
 definiti in config/settings.py (utile per test locale).
 """
 from __future__ import annotations
+
 import json
 import logging
 from flask import current_app
@@ -128,6 +129,21 @@ def get_shop_by_id(shop_id: str) -> dict | None:
     return shops.get(shop_id)
 
 
+def get_shop_by_phone_number_id(phone_number_id: str) -> tuple[dict | None, bool]:
+    """
+    Cerca uno shop per phone_number_id (numero dedicato).
+    Ritorna (shop, True) se trovato univocamente, (None, False) altrimenti.
+    """
+    pid = (phone_number_id or "").strip()
+    if not pid:
+        return None, False
+    shops = get_all_shops()
+    matches = [s for s in shops.values() if s.get("phone_number_id", "").strip() == pid]
+    if len(matches) == 1:
+        return matches[0], True
+    return None, False
+
+
 def get_all_operators() -> dict:
     """
     Legge il foglio 'operators' e restituisce un dict:
@@ -150,28 +166,33 @@ def get_all_operators() -> dict:
         if sheet is None:
             return _operators_cache
         records = sheet.get_all_records()
-        _operators_cache = {}
+        # Raggruppa tutti per shop_id, separando attivi e tutti
+        all_ops: dict[str, list] = {}
+        active_ops: dict[str, list] = {}
         for row in records:
             sid = str(row.get("shop_id", "")).strip()
             if not sid:
                 continue
-            active_val = str(row.get("active", "TRUE")).strip().upper()
-            if active_val in {"FALSE", "0", "NO", "N"}:
-                continue  # Salta operatori disattivati
             op = {
+                "shop_id": sid,
                 "operator_id": str(row.get("operator_id", "")).strip(),
-                "operator_name": row.get("operator_name", ""),
+                "operator_name": (row.get("operator_name") or row.get("operator_id", "")).strip(),
                 "calendar_id": str(row.get("calendar_id", "")).strip(),
-                "active": True,
+                "active": str(row.get("active", "TRUE")).strip().upper() not in {"FALSE", "0", "NO", "N"},
                 "priority": int(row.get("priority", 0) or 0),
                 "skills": row.get("skills", ""),
                 "gender": row.get("gender", ""),
             }
-            _operators_cache.setdefault(sid, []).append(op)
+            all_ops.setdefault(sid, []).append(op)
+            if op["active"]:
+                active_ops.setdefault(sid, []).append(op)
 
-        # Ordina per priorità (più alta prima)
-        for sid in _operators_cache:
-            _operators_cache[sid].sort(key=lambda o: o["priority"], reverse=True)
+        # Se ci sono attivi usa quelli, altrimenti usa tutti (fallback)
+        _operators_cache = {}
+        for sid in all_ops:
+            ops = active_ops.get(sid) or all_ops[sid]
+            ops.sort(key=lambda o: (o["priority"], o["operator_name"].lower()))
+            _operators_cache[sid] = ops
 
         return _operators_cache
     except Exception:
@@ -396,3 +417,9 @@ def invalidate_shops_cache():
     _services_cache = None
     _customers_cache = None
     _spreadsheet = None
+
+
+def invalidate_customers_cache():
+    """Invalida solo la cache customers."""
+    global _customers_cache
+    _customers_cache = None
