@@ -114,6 +114,102 @@ def create_app():
                     else:
                         checks["shops_sheet"] = f"❌ Foglio 'shops' NON trovato! Fogli disponibili: {worksheets}"
 
+                    # 7. Prova a leggere il foglio "operators"
+                    if "operators" in worksheets:
+                        ws_op = spreadsheet.worksheet("operators")
+                        op_records = ws_op.get_all_records()
+                        checks["operators_sheet"] = f"✅ Foglio 'operators' trovato – {len(op_records)} righe"
+                        if op_records:
+                            op_headers = list(op_records[0].keys())
+                            checks["operators_headers"] = f"📋 Colonne: {op_headers}"
+                            for idx, r in enumerate(op_records):
+                                oid = str(r.get('operator_id', '')).strip()
+                                oname = r.get('operator_name', '')
+                                osid = str(r.get('shop_id', '')).strip()
+                                active = r.get('active', '')
+                                cal = r.get('calendar_id', '')
+                                checks[f"op_{idx+1}_{oid}"] = (
+                                    f"👤 {oname} (shop: {osid}, "
+                                    f"active: {active}, calendar: {cal})"
+                                )
+                        else:
+                            checks["operators_data"] = "⚠️ Il foglio 'operators' è vuoto"
+                    else:
+                        checks["operators_sheet"] = "⚠️ Foglio 'operators' non trovato"
+
+                    # 8. Prova a leggere il foglio "hours"
+                    if "hours" in worksheets:
+                        ws_hr = spreadsheet.worksheet("hours")
+                        hr_records = ws_hr.get_all_records()
+                        checks["hours_sheet"] = f"✅ Foglio 'hours' trovato – {len(hr_records)} righe"
+                        if hr_records:
+                            hr_headers = list(hr_records[0].keys())
+                            checks["hours_headers"] = f"📋 Colonne: {hr_headers}"
+                            for idx, r in enumerate(hr_records):
+                                hsid = str(r.get('shop_id', '')).strip()
+                                day = r.get('weekday', '')
+                                start = r.get('start', '')
+                                end = r.get('end', '')
+                                ps = r.get('pause-start', '')
+                                pe = r.get('pause-end', '')
+                                pause = f", pausa {ps}-{pe}" if ps else ""
+                                checks[f"hr_{idx+1}_{hsid}_{day}"] = (
+                                    f"🕐 {hsid} · {day}: {start}–{end}{pause}"
+                                )
+                        else:
+                            checks["hours_data"] = "⚠️ Il foglio 'hours' è vuoto"
+                    else:
+                        checks["hours_sheet"] = "⚠️ Foglio 'hours' non trovato"
+
+                    # 9. Prova a leggere il foglio "services"
+                    if "services" in worksheets:
+                        ws_sv = spreadsheet.worksheet("services")
+                        sv_records = ws_sv.get_all_records()
+                        checks["services_sheet"] = f"✅ Foglio 'services' trovato – {len(sv_records)} righe"
+                        if sv_records:
+                            sv_headers = list(sv_records[0].keys())
+                            checks["services_headers"] = f"📋 Colonne: {sv_headers}"
+                            for idx, r in enumerate(sv_records):
+                                ssid = str(r.get('shop_id', '')).strip()
+                                sname = r.get('name', '')
+                                dur = r.get('duration', '')
+                                price = r.get('price', '')
+                                cat = r.get('category', '')
+                                active = r.get('active', '')
+                                checks[f"svc_{idx+1}_{ssid}"] = (
+                                    f"💇 {sname} · {dur}min · €{price} · "
+                                    f"cat: {cat} · active: {active} (shop: {ssid})"
+                                )
+                        else:
+                            checks["services_data"] = "⚠️ Il foglio 'services' è vuoto"
+                    else:
+                        checks["services_sheet"] = "⚠️ Foglio 'services' non trovato"
+
+                    # 10. Prova a leggere il foglio "customers"
+                    cust_tab = app.config.get("CUSTOMERS_TAB", "customers")
+                    if cust_tab in worksheets:
+                        ws_cu = spreadsheet.worksheet(cust_tab)
+                        cu_records = ws_cu.get_all_records()
+                        checks["customers_sheet"] = f"✅ Foglio '{cust_tab}' trovato – {len(cu_records)} righe"
+                        if cu_records:
+                            cu_headers = list(cu_records[0].keys())
+                            checks["customers_headers"] = f"📋 Colonne: {cu_headers}"
+                            for idx, r in enumerate(cu_records[:10]):  # mostra max 10
+                                cphone = str(r.get('phone', '')).strip()
+                                cname = r.get('customer_name', '')
+                                csid = str(r.get('shop_id', '')).strip()
+                                visits = r.get('total_visits', 0)
+                                checks[f"cust_{idx+1}"] = (
+                                    f"👤 {cname or '(no name)'} · "
+                                    f"tel: {cphone} · shop: {csid} · visite: {visits}"
+                                )
+                            if len(cu_records) > 10:
+                                checks["customers_more"] = f"… e altri {len(cu_records) - 10} clienti"
+                        else:
+                            checks["customers_data"] = f"⚠️ Il foglio '{cust_tab}' è vuoto"
+                    else:
+                        checks["customers_sheet"] = f"⚠️ Foglio '{cust_tab}' non trovato"
+
                 except Exception as e:
                     checks["spreadsheet_open"] = f"❌ Errore apertura spreadsheet: {e}"
 
@@ -122,7 +218,7 @@ def create_app():
             except Exception as e:
                 checks["gspread_auth"] = f"❌ Errore autenticazione: {e}"
 
-        # 4. Invalida la cache per forzare il refresh
+        # 8. Invalida la cache per forzare il refresh
         from services.sheets_service import invalidate_shops_cache
         invalidate_shops_cache()
         checks["cache"] = "🔄 Cache invalidata"
