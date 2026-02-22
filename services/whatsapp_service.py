@@ -1,5 +1,6 @@
 """
 Servizio WhatsApp – invio messaggi tramite Meta Cloud API.
+Usa requests.Session per connection pooling (keep-alive).
 """
 from __future__ import annotations
 import logging
@@ -7,6 +8,23 @@ import requests
 from flask import current_app
 
 log = logging.getLogger(__name__)
+
+# Session persistente per connection pooling (keep-alive HTTP)
+_session: requests.Session | None = None
+
+
+def _get_session() -> requests.Session:
+    """Restituisce una session con connection pooling."""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=5,
+            pool_maxsize=10,
+            max_retries=1,
+        )
+        _session.mount("https://", adapter)
+    return _session
 
 
 def _graph_api_base() -> str:
@@ -37,7 +55,7 @@ def send_text_message(to: str, text: str, phone_number_id: str | None = None):
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        resp = _get_session().post(url, json=payload, headers=headers, timeout=8)
         resp.raise_for_status()
         log.info("Messaggio inviato a %s", to)
         return resp.json()
@@ -61,7 +79,7 @@ def send_interactive_buttons(to: str, body: str, buttons: list[dict], phone_numb
     }
 
     action_buttons = []
-    for btn in buttons[:3]:  # max 3 bottoni
+    for btn in buttons[:3]:
         action_buttons.append({
             "type": "reply",
             "reply": {
@@ -82,7 +100,7 @@ def send_interactive_buttons(to: str, body: str, buttons: list[dict], phone_numb
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        resp = _get_session().post(url, json=payload, headers=headers, timeout=8)
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException:

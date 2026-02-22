@@ -1,14 +1,12 @@
 """
 Blueprint – Webhook WhatsApp (Meta Cloud API).
 Gestisce la verifica del webhook e i messaggi in arrivo.
+Processa i messaggi in background per rispondere subito 200 a Meta.
 """
 
 import logging
+import threading
 from flask import Blueprint, request, jsonify, current_app
-from services.whatsapp_service import send_text_message
-from services.customer_service import upsert_customer_shop, get_customer
-from services.sheets_service import get_shop_by_id
-from services.bot_flow import handle_bot
 from utils.meta_signature import verify_signature
 
 log = logging.getLogger(__name__)
@@ -30,6 +28,83 @@ def webhook_verify():
     return "Forbidden", 403
 
 
+def _process_message(app, data):
+    """Processa i messaggi in un thread separato (con app context)."""
+    with app.app_context():
+        from services.whatsapp_service import send_text_message
+        from services.customer_service import upsert_customer_shop, get_customer
+        from services.sheets_service import get_shop_by_id
+        from services.bot_flow import handle_bot
+
+        try:
+            entries = data.get("entry", [])
+            for entry in entries:
+                changes = entry.get("changes", [])
+                for change in changes:
+                    value = change.get("value", {})
+                    messages = value.get("messages", [])
+                    contacts = value.get("contacts", [])
+                    metadata = value.get("metadata", {})
+                    phone_number_id = metadata.get("phone_number_id", "")
+
+                    for i, msg in enumerate(messages):
+                        from_phone = msg.get("from", "")
+                        msg_type = msg.get("type", "")
+
+                        # Nome del contatto
+                        contact_name = ""
+                        if i < len(contacts):
+                            profile = contacts[i].get("profile", {})
+                            contact_name = profile.get("name", "")
+
+                        # ── Testo del messaggio ───────────────────
+                        incoming_text = ""
+                        interactive_reply = None
+
+                        if msg_type == "text":
+                            incoming_text = msg["text"].get("body", "").strip()
+                        elif msg_type == "interactive":
+                            interactive = msg.get("interactive", {})
+                            ir_type = interactive.get("type", "")
+                            if ir_type == "button_reply":
+                                interactive_reply = interactive.get("button_reply", {})
+                            elif ir_type == "list_reply":
+                                interactive_reply = interactive.get("list_reply", {})
+
+                        # ── Intercetta START_<shop_id> ────────────
+                        if incoming_text.startswith("START_"):
+                            shop_id = incoming_text.replace("START_", "").strip()
+                            shop = get_shop_by_id(shop_id)
+                            if shop:
+                                upsert_customer_shop(
+                                    from_phone,
+                                    shop_id,
+                                    customer_name=contact_name,
+                                    last_seen_phone_number_id=phone_number_id,
+                                    touch_updated_at=True,
+                                )
+                                handle_bot(shop, from_phone, contact_name, "", None, phone_number_id)
+                                log.info("START_%s → avviato bot per %s", shop_id, from_phone)
+                                continue
+
+                        # ── Messaggio normale → risolvi shop dal cliente ──
+                        customer = get_customer(from_phone)
+                        if customer:
+                            shop = get_shop_by_id(customer["shop_id"])
+                            if shop:
+                                handle_bot(shop, from_phone, contact_name,
+                                           incoming_text, interactive_reply, phone_number_id)
+                                log.info("Messaggio da %s (shop %s): %s",
+                                         from_phone, customer["shop_id"],
+                                         incoming_text[:80] if incoming_text else "[interactive]")
+                                continue
+
+                        log.warning("Messaggio da %s ma nessuno shop associato", from_phone)
+
+        except Exception:
+            log.exception("Errore nel processing del messaggio")
+
+
 # ── POST /webhook  – Ricezione messaggi ───────────────────────
 @webhook_bp.route("/webhook", methods=["POST"])
 def webhook_receive():
@@ -37,73 +112,9 @@ def webhook_receive():
     if not data:
         return jsonify({"status": "no data"}), 400
 
-    try:
-        entries = data.get("entry", [])
-        for entry in entries:
-            changes = entry.get("changes", [])
-            for change in changes:
-                value = change.get("value", {})
-                messages = value.get("messages", [])
-                contacts = value.get("contacts", [])
-                metadata = value.get("metadata", {})
-                phone_number_id = metadata.get("phone_number_id", "")
+    # Rispondi subito 200 a Meta, processa in background
+    app = current_app._get_current_object()
+    thread = threading.Thread(target=_process_message, args=(app, data), daemon=True)
+    thread.start()
 
-                for i, msg in enumerate(messages):
-                    from_phone = msg.get("from", "")
-                    msg_type = msg.get("type", "")
-
-                    # Nome del contatto
-                    contact_name = ""
-                    if i < len(contacts):
-                        profile = contacts[i].get("profile", {})
-                        contact_name = profile.get("name", "")
-
-                    # ── Testo del messaggio ───────────────────
-                    incoming_text = ""
-                    interactive_reply = None
-
-                    if msg_type == "text":
-                        incoming_text = msg["text"].get("body", "").strip()
-                    elif msg_type == "interactive":
-                        interactive = msg.get("interactive", {})
-                        ir_type = interactive.get("type", "")
-                        if ir_type == "button_reply":
-                            interactive_reply = interactive.get("button_reply", {})
-                        elif ir_type == "list_reply":
-                            interactive_reply = interactive.get("list_reply", {})
-
-                    # ── Intercetta START_<shop_id> ────────────
-                    if incoming_text.startswith("START_"):
-                        shop_id = incoming_text.replace("START_", "").strip()
-                        shop = get_shop_by_id(shop_id)
-                        if shop:
-                            upsert_customer_shop(
-                                from_phone,
-                                shop_id,
-                                customer_name=contact_name,
-                                last_seen_phone_number_id=phone_number_id,
-                                touch_updated_at=True,
-                            )
-                            handle_bot(shop, from_phone, contact_name, "", None, phone_number_id)
-                            log.info("START_%s → avviato bot per %s", shop_id, from_phone)
-                            continue
-
-                    # ── Messaggio normale → risolvi shop dal cliente ──
-                    customer = get_customer(from_phone)
-                    if customer:
-                        shop = get_shop_by_id(customer["shop_id"])
-                        if shop:
-                            handle_bot(shop, from_phone, contact_name,
-                                       incoming_text, interactive_reply, phone_number_id)
-                            log.info("Messaggio da %s (shop %s): %s",
-                                     from_phone, customer["shop_id"],
-                                     incoming_text[:80] if incoming_text else "[interactive]")
-                            continue
-
-                    log.warning("Messaggio da %s ma nessuno shop associato", from_phone)
-
-    except Exception:
-        log.exception("Errore nel webhook")
-
-    # Rispondi sempre 200 a Meta per evitare retry
     return jsonify({"status": "ok"}), 200

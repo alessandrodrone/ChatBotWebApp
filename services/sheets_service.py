@@ -11,13 +11,14 @@ from flask import current_app
 
 log = logging.getLogger(__name__)
 
-# Cache in memoria (opzionale, evita chiamate ripetute)
+# Cache in memoria
 _sheets_client = None
+_spreadsheet = None  # Cache dell'oggetto spreadsheet
 _shops_cache: dict | None = None
-_operators_cache: dict | None = None  # {shop_id: [operator_dict, ...]}
-_hours_cache: dict | None = None  # {shop_id: [hour_dict, ...]}
-_services_cache: dict | None = None  # {shop_id: [service_dict, ...]}
-_customers_cache: dict | None = None  # {phone: customer_dict}
+_operators_cache: dict | None = None
+_hours_cache: dict | None = None
+_services_cache: dict | None = None
+_customers_cache: dict | None = None
 
 
 def _get_gspread_client():
@@ -47,6 +48,33 @@ def _get_gspread_client():
         return None
 
 
+def _get_spreadsheet():
+    """Restituisce l'oggetto spreadsheet, con cache."""
+    global _spreadsheet
+    if _spreadsheet is not None:
+        return _spreadsheet
+
+    client = _get_gspread_client()
+    if client is None:
+        return None
+
+    try:
+        spreadsheet_id = current_app.config["GOOGLE_SHEET_ID"]
+        _spreadsheet = client.open_by_key(spreadsheet_id)
+        return _spreadsheet
+    except Exception:
+        log.exception("Errore apertura spreadsheet")
+        return None
+
+
+def _get_worksheet(name: str):
+    """Restituisce un worksheet per nome, usando lo spreadsheet in cache."""
+    ss = _get_spreadsheet()
+    if ss is None:
+        return None
+    return ss.worksheet(name)
+
+
 def get_all_shops() -> dict:
     """Restituisce tutti gli shop come dict {shop_id: shop_data}."""
     global _shops_cache
@@ -61,8 +89,10 @@ def get_all_shops() -> dict:
         return _shops_cache
 
     try:
-        spreadsheet_id = current_app.config["GOOGLE_SHEET_ID"]
-        sheet = client.open_by_key(spreadsheet_id).worksheet("shops")
+        sheet = _get_worksheet("shops")
+        if sheet is None:
+            _shops_cache = current_app.config.get("DEMO_SHOPS", {})
+            return _shops_cache
         records = sheet.get_all_records()
         _shops_cache = {}
         for row in records:
@@ -116,8 +146,9 @@ def get_all_operators() -> dict:
         return _operators_cache
 
     try:
-        spreadsheet_id = current_app.config["GOOGLE_SHEET_ID"]
-        sheet = client.open_by_key(spreadsheet_id).worksheet("operators")
+        sheet = _get_worksheet("operators")
+        if sheet is None:
+            return _operators_cache
         records = sheet.get_all_records()
         _operators_cache = {}
         for row in records:
@@ -172,8 +203,9 @@ def get_all_hours() -> dict:
         return _hours_cache
 
     try:
-        spreadsheet_id = current_app.config["GOOGLE_SHEET_ID"]
-        sheet = client.open_by_key(spreadsheet_id).worksheet("hours")
+        sheet = _get_worksheet("hours")
+        if sheet is None:
+            return _hours_cache
         records = sheet.get_all_records()
         _hours_cache = {}
         for row in records:
@@ -219,8 +251,9 @@ def get_all_services() -> dict:
         return _services_cache
 
     try:
-        spreadsheet_id = current_app.config["GOOGLE_SHEET_ID"]
-        sheet = client.open_by_key(spreadsheet_id).worksheet("services")
+        sheet = _get_worksheet("services")
+        if sheet is None:
+            return _services_cache
         records = sheet.get_all_records()
         _services_cache = {}
         for row in records:
@@ -270,9 +303,10 @@ def get_all_customers() -> dict:
         return _customers_cache
 
     try:
-        spreadsheet_id = current_app.config["GOOGLE_SHEET_ID"]
         tab_name = current_app.config.get("CUSTOMERS_TAB", "customers")
-        sheet = client.open_by_key(spreadsheet_id).worksheet(tab_name)
+        sheet = _get_worksheet(tab_name)
+        if sheet is None:
+            return _customers_cache
         records = sheet.get_all_records()
         _customers_cache = {}
         for row in records:
@@ -310,44 +344,37 @@ def upsert_customer_to_sheet(
 ):
     """
     Crea o aggiorna un cliente sul foglio 'customers'.
-    Cerca per numero di telefono; se esiste aggiorna, altrimenti appende.
+    Usa batch_update per ridurre le chiamate API.
     """
     from datetime import datetime, timezone
 
-    client = _get_gspread_client()
-    if client is None:
-        log.warning("Google Sheets non configurato – customer non salvato.")
-        return
-
     try:
-        spreadsheet_id = current_app.config["GOOGLE_SHEET_ID"]
         tab_name = current_app.config.get("CUSTOMERS_TAB", "customers")
-        sheet = client.open_by_key(spreadsheet_id).worksheet(tab_name)
+        sheet = _get_worksheet(tab_name)
+        if sheet is None:
+            log.warning("Google Sheets non configurato – customer non salvato.")
+            return
+
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         # Cerca se il cliente esiste già (colonna B = phone)
         try:
             cell = sheet.find(phone, in_column=2)
             row_num = cell.row
-            # Aggiorna i campi
-            sheet.update_cell(row_num, 1, shop_id)  # shop_id
+            # Batch update: una sola chiamata API per aggiornare più celle
+            updates = [{"range": f"A{row_num}", "values": [[shop_id]]}]
             if customer_name:
-                sheet.update_cell(row_num, 6, customer_name)  # customer_name
+                updates.append({"range": f"F{row_num}", "values": [[customer_name]]})
             if last_seen_phone_number_id:
-                sheet.update_cell(row_num, 7, last_seen_phone_number_id)
-            sheet.update_cell(row_num, 8, now)  # updated_at
+                updates.append({"range": f"G{row_num}", "values": [[last_seen_phone_number_id]]})
+            updates.append({"range": f"H{row_num}", "values": [[now]]})
+            sheet.batch_update(updates, value_input_option="USER_ENTERED")
             log.info("Customer %s aggiornato su sheet (riga %s)", phone, row_num)
         except Exception:
             # Non trovato → appendi nuova riga
             new_row = [
-                shop_id,
-                phone,
-                "",  # last_service
-                0,   # total_visits
-                "",  # last_visit
-                customer_name,
-                last_seen_phone_number_id,
-                now,
+                shop_id, phone, "", 0, "",
+                customer_name, last_seen_phone_number_id, now,
             ]
             sheet.append_row(new_row, value_input_option="USER_ENTERED")
             log.info("Customer %s aggiunto su sheet", phone)
@@ -362,9 +389,10 @@ def upsert_customer_to_sheet(
 
 def invalidate_shops_cache():
     """Invalida la cache – utile dopo un aggiornamento del foglio."""
-    global _shops_cache, _operators_cache, _hours_cache, _services_cache, _customers_cache
+    global _shops_cache, _operators_cache, _hours_cache, _services_cache, _customers_cache, _spreadsheet
     _shops_cache = None
     _operators_cache = None
     _hours_cache = None
     _services_cache = None
     _customers_cache = None
+    _spreadsheet = None
