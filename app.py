@@ -103,6 +103,12 @@ def create_app():
                             # Mostra i primi shop trovati
                             shop_ids = [str(r.get("id", "")).strip() for r in records if str(r.get("id", "")).strip()]
                             checks["shop_ids"] = f"🏪 Shop IDs trovati: {shop_ids}"
+                            # Mostra dettagli di ogni negozio
+                            for idx, r in enumerate(records):
+                                sid = str(r.get("id", "")).strip()
+                                if sid:
+                                    details = " · ".join(f"{k}: {v}" for k, v in r.items())
+                                    checks[f"shop_{idx+1}_{sid}"] = f"🏪 {details}"
                         else:
                             checks["shops_data"] = "⚠️ Il foglio 'shops' è vuoto (nessuna riga dati)"
                     else:
