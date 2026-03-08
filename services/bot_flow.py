@@ -41,6 +41,7 @@ from services.calendar_service import (
     find_upcoming_customer_event,
     can_change_booking,
     booking_key,
+    parse_work_phases,
 )
 from utils.helpers import (
     norm_phone, norm_text, safe_lower, parse_int, parse_bool,
@@ -164,6 +165,7 @@ def _do_booking(shop, from_phone, sess, operators, tz, phone_number_id, key):
         booking_key(shop_id, from_phone, services_txt, start),
         summary_override=summary,
         booking_notes=sess.get("booking_notes", ""),
+        work_phases_json=sess.get("picked_work_phases", ""),
     )
 
     try:
@@ -251,6 +253,7 @@ def handle_bot(
             "picked": [],
             "picked_names": [],
             "picked_total_min": 0,
+            "picked_work_phases": "",
             "auto_assign_operator": False,
         }
     if contact_name:
@@ -328,6 +331,7 @@ def handle_bot(
             sess["picked"] = []
             sess["picked_names"] = [svc_name]
             sess["picked_total_min"] = dur_min
+            sess["picked_work_phases"] = ev_priv.get("work_phases", "")
             sess["state"] = "PERIOD"
             save_session(key, sess)
             _send_period_buttons(shop, from_phone)
@@ -421,6 +425,7 @@ def handle_bot(
             sess["picked"] = []
             sess["picked_names"] = []
             sess["picked_total_min"] = 0
+            sess["picked_work_phases"] = ""
             sess["state"] = "SERVICES"
             save_session(key, sess)
             send_text_message(shop, from_phone, "Ok, scegli di nuovo il servizio:")
@@ -481,6 +486,11 @@ def handle_bot(
             sess["picked"].append(interactive_id)
             sess["picked_names"].append(svc.get("name"))
             sess["picked_total_min"] += int(svc.get("duration", 30))
+            # work_phases: valido solo per servizio singolo
+            if len(sess["picked"]) == 1:
+                sess["picked_work_phases"] = svc.get("work_phases", "")
+            else:
+                sess["picked_work_phases"] = ""
             save_session(key, sess)
 
             send_interactive_buttons(
@@ -531,11 +541,13 @@ def handle_bot(
             base_day = dt.datetime.now(tz).date() + dt.timedelta(days=start_off)
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
+            wp = parse_work_phases(sess.get("picked_work_phases", ""))
 
             days = list_available_days(
                 hours, op_list, base_day, dur, slot_minutes, tz,
                 min(10, end_off - start_off),
                 max_concurrent=max_concurrent, all_operators=operators,
+                work_phases=wp or None,
             )
             if not days:
                 send_text_message(
@@ -552,6 +564,7 @@ def handle_bot(
             sess["picked"] = []
             sess["picked_names"] = []
             sess["picked_total_min"] = 0
+            sess["picked_work_phases"] = ""
             sess.pop("day", None)
             sess.pop("pending_start", None)
             sess.pop("pending_operator", None)
@@ -580,10 +593,12 @@ def handle_bot(
             base_day = dt.datetime.now(tz).date() + dt.timedelta(days=start_off)
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
+            wp = parse_work_phases(sess.get("picked_work_phases", ""))
             days = list_available_days(
                 hours, op_list, base_day, dur, slot_minutes, tz,
                 min(10, end_off - start_off),
                 max_concurrent=max_concurrent, all_operators=operators,
+                work_phases=wp or None,
             )
             if not days:
                 send_text_message(shop, from_phone, "Non trovo disponibilità.")
@@ -608,9 +623,11 @@ def handle_bot(
             dur = int(sess.get("picked_total_min") or 30)
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
+            wp = parse_work_phases(sess.get("picked_work_phases", ""))
             all_slots = list_free_slots_for_day(
                 hours, op_list, day, dur, slot_minutes, tz, MAX_TIME_OPTIONS,
                 max_concurrent=max_concurrent, all_operators=operators,
+                work_phases=wp or None,
             )
             all_slots = _filter_min_advance(shop, all_slots, tz)
 
@@ -693,9 +710,11 @@ def handle_bot(
 
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
+            wp = parse_work_phases(sess.get("picked_work_phases", ""))
             raw_slots = list_free_slots_for_day(
                 hours, op_list, day, dur, slot_minutes, tz, MAX_TIME_OPTIONS,
                 max_concurrent=max_concurrent, all_operators=operators,
+                work_phases=wp or None,
             )
             raw_slots = _filter_min_advance(shop, raw_slots, tz)
 
@@ -728,7 +747,8 @@ def handle_bot(
 
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
-            op = find_free_operator_for_slot(op_list, start, end, tz)
+            wp = parse_work_phases(sess.get("picked_work_phases", ""))
+            op = find_free_operator_for_slot(op_list, start, end, tz, work_phases=wp or None)
             if not op:
                 send_text_message(shop, from_phone, "⚠️ L'orario non è più disponibile. Scegli un altro.")
                 return
@@ -777,6 +797,7 @@ def handle_bot(
             sess["picked"] = []
             sess["picked_names"] = []
             sess["picked_total_min"] = 0
+            sess["picked_work_phases"] = ""
             sess.pop("day", None)
             sess.pop("pending_start", None)
             sess.pop("pending_operator", None)

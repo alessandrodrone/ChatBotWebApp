@@ -66,6 +66,72 @@ def _has_block_keyword(summary: str) -> bool:
     return any(k in s for k in BLOCK_KEYWORDS)
 
 
+# ── Work‑phases helpers ──────────────────────────────────────
+
+def parse_work_phases(phases_json: str) -> List[Dict]:
+    """Parse work_phases JSON → lista di fasi con offset in minuti.
+
+    Esempio input: '[{"work":60},{"pause_free":60},{"work":30}]'
+    Output: [{'type':'work','start_offset':0,'end_offset':60,'duration':60}, ...]
+    """
+    if not phases_json or not str(phases_json).strip():
+        return []
+    try:
+        phases = json.loads(str(phases_json))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(phases, list):
+        return []
+    result: List[Dict] = []
+    offset = 0
+    for p in phases:
+        if not isinstance(p, dict):
+            continue
+        for ptype in ("work", "pause", "pause_free"):
+            if ptype in p:
+                try:
+                    dur = int(p[ptype])
+                except (ValueError, TypeError):
+                    continue
+                result.append({
+                    "type": ptype,
+                    "start_offset": offset,
+                    "end_offset": offset + dur,
+                    "duration": dur,
+                })
+                offset += dur
+                break
+    return result
+
+
+def _get_busy_intervals(
+    start: dt.datetime, phases: List[Dict],
+) -> List[Tuple[dt.datetime, dt.datetime]]:
+    """Intervalli in cui l'operatore è occupato (work + pause, NON pause_free)."""
+    intervals: List[Tuple[dt.datetime, dt.datetime]] = []
+    for ph in phases:
+        if ph["type"] in ("work", "pause"):
+            ph_start = start + dt.timedelta(minutes=ph["start_offset"])
+            ph_end = start + dt.timedelta(minutes=ph["end_offset"])
+            intervals.append((ph_start, ph_end))
+    return intervals
+
+
+def _ev_overlaps_busy(
+    ev_start: dt.datetime, ev_phases: List[Dict],
+    check_start: dt.datetime, check_end: dt.datetime,
+) -> bool:
+    """True se [check_start, check_end] sovrappone una fase busy di un evento."""
+    for ph in ev_phases:
+        if ph["type"] == "pause_free":
+            continue
+        ph_start = ev_start + dt.timedelta(minutes=ph["start_offset"])
+        ph_end = ev_start + dt.timedelta(minutes=ph["end_offset"])
+        if ph_start < check_end and ph_end > check_start:
+            return True
+    return False
+
+
 def _load_day_events(calendar_id: str, day: dt.date, tz: dt.tzinfo) -> List[Dict]:
     """Carica TUTTI gli eventi di un giorno in una sola chiamata API."""
     cal = _get_calendar_client()
@@ -92,7 +158,11 @@ def _load_day_events(calendar_id: str, day: dt.date, tz: dt.tzinfo) -> List[Dict
 def _slot_is_free_with_events(
     events: List[Dict], start: dt.datetime, end: dt.datetime
 ) -> bool:
-    """Verifica se uno slot è libero usando eventi pre-caricati (zero API call)."""
+    """Verifica se uno slot è libero usando eventi pre-caricati.
+
+    Tiene conto di work_phases sugli eventi esistenti: durante le fasi
+    pause_free l'operatore è considerato libero.
+    """
     for ev in events:
         summary = ev.get("summary", "")
         transparency = ev.get("transparency", "")
@@ -111,13 +181,26 @@ def _slot_is_free_with_events(
         if ev_start >= end or ev_end <= start:
             continue
 
-        # Keyword di blocco → occupato
+        # Keyword di blocco → sempre occupato
         if _has_block_keyword(summary):
             return False
 
-        # Evento opaco (non transparent) → occupato
-        if transparency != "transparent":
-            return False
+        # Evento trasparente → non blocca
+        if transparency == "transparent":
+            continue
+
+        # ── Work‑phases: se l'evento ha fasi, blocca solo work/pause ──
+        ep = (ev.get("extendedProperties") or {}).get("private") or {}
+        phases_json = ep.get("work_phases", "")
+        if phases_json:
+            phases = parse_work_phases(phases_json)
+            if phases:
+                if _ev_overlaps_busy(ev_start, phases, start, end):
+                    return False
+                continue  # sovrapposizione solo in pause_free → libero
+
+        # Evento opaco senza fasi → occupato
+        return False
 
     return True
 
@@ -139,10 +222,35 @@ def _find_free_operator_with_events(
     return None
 
 
+def _find_free_operator_for_intervals(
+    operators: List[Dict],
+    events_by_cal: Dict[str, List[Dict]],
+    busy_intervals: List[Tuple[dt.datetime, dt.datetime]],
+) -> Optional[Dict]:
+    """Trova un operatore libero in TUTTI gli intervalli busy (work_phases)."""
+    for op in operators:
+        cal_id = op.get("calendar_id")
+        if not cal_id:
+            continue
+        events = events_by_cal.get(cal_id, [])
+        all_free = True
+        for iv_start, iv_end in busy_intervals:
+            if not _slot_is_free_with_events(events, iv_start, iv_end):
+                all_free = False
+                break
+        if all_free:
+            return op
+    return None
+
+
 def _count_concurrent_events(
     events_by_cal: Dict[str, List[Dict]], start: dt.datetime, end: dt.datetime
 ) -> int:
-    """Conta eventi opachi sovrapposti a uno slot su TUTTI i calendari."""
+    """Conta eventi opachi sovrapposti a uno slot su TUTTI i calendari.
+
+    Se un evento ha work_phases, conta la sovrapposizione solo se
+    ricade in una fase work/pause (non pause_free).
+    """
     count = 0
     for events in events_by_cal.values():
         for ev in events:
@@ -156,9 +264,20 @@ def _count_concurrent_events(
             except Exception:
                 continue
             if ev_start < end and ev_end > start:
-                if not _has_block_keyword(ev.get("summary", "")):
-                    if ev.get("transparency") != "transparent":
-                        count += 1
+                if _has_block_keyword(ev.get("summary", "")):
+                    continue
+                if ev.get("transparency") == "transparent":
+                    continue
+                # Work‑phases: conta solo se sovrappone una fase busy
+                ep = (ev.get("extendedProperties") or {}).get("private") or {}
+                ph_json = ep.get("work_phases", "")
+                if ph_json:
+                    phases = parse_work_phases(ph_json)
+                    if phases:
+                        if _ev_overlaps_busy(ev_start, phases, start, end):
+                            count += 1
+                        continue
+                count += 1
     return count
 
 
@@ -219,11 +338,13 @@ def list_free_slots_for_day(
     *,
     max_concurrent: int = 0,
     all_operators: Optional[List[Dict]] = None,
+    work_phases: Optional[List[Dict]] = None,
 ) -> List[Tuple[dt.datetime, Dict]]:
     """
     Trova slot liberi per un giorno.
     max_concurrent: limite globale appuntamenti per slot (0 = no limite).
     all_operators: tutti gli operatori del negozio (per conteggio globale).
+    work_phases: se presente, controlla solo le fasi busy (non pause_free).
     """
     out: List[Tuple[dt.datetime, Dict]] = []
     ranges = hours.get(day.weekday(), []) or []
@@ -231,12 +352,10 @@ def list_free_slots_for_day(
     # Pre-carica eventi
     if events_by_cal is None:
         events_by_cal = {}
-        # Carica per gli operatori da cercare
         for op in operators:
             cal_id = op.get("calendar_id")
             if cal_id and cal_id not in events_by_cal:
                 events_by_cal[cal_id] = _load_day_events(cal_id, day, tz)
-        # Se max_concurrent, carica anche per tutti gli altri operatori
         if max_concurrent > 0 and all_operators:
             for op in all_operators:
                 cal_id = op.get("calendar_id")
@@ -248,14 +367,35 @@ def list_free_slots_for_day(
         end_limit = dt.datetime.combine(day, en, tzinfo=tz)
         while cur + dt.timedelta(minutes=dur_min) <= end_limit:
             end_dt = cur + dt.timedelta(minutes=dur_min)
-            op = _find_free_operator_with_events(operators, events_by_cal, cur, end_dt)
+
+            # ── Cerca operatore libero ──
+            if work_phases:
+                busy_ivs = _get_busy_intervals(cur, work_phases)
+                op = _find_free_operator_for_intervals(
+                    operators, events_by_cal, busy_ivs,
+                )
+            else:
+                op = _find_free_operator_with_events(
+                    operators, events_by_cal, cur, end_dt,
+                )
+
             if op:
                 # Verifica limite globale
                 if max_concurrent > 0:
-                    total = _count_concurrent_events(events_by_cal, cur, end_dt)
-                    if total >= max_concurrent:
-                        cur += dt.timedelta(minutes=slot_minutes)
-                        continue
+                    if work_phases:
+                        over = False
+                        for bi_s, bi_e in _get_busy_intervals(cur, work_phases):
+                            if _count_concurrent_events(events_by_cal, bi_s, bi_e) >= max_concurrent:
+                                over = True
+                                break
+                        if over:
+                            cur += dt.timedelta(minutes=slot_minutes)
+                            continue
+                    else:
+                        total = _count_concurrent_events(events_by_cal, cur, end_dt)
+                        if total >= max_concurrent:
+                            cur += dt.timedelta(minutes=slot_minutes)
+                            continue
                 out.append((cur, op))
                 if len(out) >= limit:
                     return out
@@ -274,6 +414,7 @@ def list_available_days(
     *,
     max_concurrent: int = 0,
     all_operators: Optional[List[Dict]] = None,
+    work_phases: Optional[List[Dict]] = None,
 ) -> List[dt.date]:
     """
     Trova giorni con almeno uno slot libero.
@@ -299,6 +440,7 @@ def list_available_days(
             hours, operators, day, dur_min, slot_minutes,
             tz, limit=1, events_by_cal=events_by_cal,
             max_concurrent=max_concurrent, all_operators=all_operators,
+            work_phases=work_phases,
         )
         if slots:
             days.append(day)
@@ -308,7 +450,8 @@ def list_available_days(
 
 
 def find_free_operator_for_slot(
-    operators: List[Dict], start: dt.datetime, end: dt.datetime, tz: dt.tzinfo
+    operators: List[Dict], start: dt.datetime, end: dt.datetime,
+    tz: dt.tzinfo, *, work_phases: Optional[List[Dict]] = None,
 ) -> Optional[Dict]:
     """Verifica in tempo reale quale operatore è libero per uno slot specifico."""
     day = start.date()
@@ -317,6 +460,9 @@ def find_free_operator_for_slot(
         cal_id = op.get("calendar_id")
         if cal_id and cal_id not in events_by_cal:
             events_by_cal[cal_id] = _load_day_events(cal_id, day, tz)
+    if work_phases:
+        busy_ivs = _get_busy_intervals(start, work_phases)
+        return _find_free_operator_for_intervals(operators, events_by_cal, busy_ivs)
     return _find_free_operator_with_events(operators, events_by_cal, start, end)
 
 
@@ -334,6 +480,7 @@ def create_booking_event(
     *,
     summary_override: str = "",
     booking_notes: str = "",
+    work_phases_json: str = "",
 ) -> str:
     """Crea un evento di prenotazione su Google Calendar."""
     cal = _get_calendar_client()
@@ -376,6 +523,8 @@ def create_booking_event(
             }
         },
     }
+    if work_phases_json:
+        body["extendedProperties"]["private"]["work_phases"] = work_phases_json
 
     try:
         ev = cal.events().insert(calendarId=calendar_id, body=body).execute()
