@@ -150,9 +150,9 @@ def _process_message(app, data):
 
                                 if not incoming_text and not interactive_id:
                                     send_text_message(
+                                        hinted_shop,
                                         from_phone,
                                         f"✅ Connesso a *{hinted_shop.get('name', 'questa sede')}*.",
-                                        phone_number_id,
                                     )
 
                                 handle_bot(hinted_shop, from_phone, contact_name, "", None, phone_number_id)
@@ -168,9 +168,9 @@ def _process_message(app, data):
                         shop = get_shop_by_id(saved_shop_id) if saved_shop_id else None
                         if not shop:
                             send_text_message(
+                                {},
                                 from_phone,
                                 "Per iniziare apri il bot dal QR/link del negozio (contiene `SHOP=...`).",
-                                phone_number_id,
                             )
                             continue
 

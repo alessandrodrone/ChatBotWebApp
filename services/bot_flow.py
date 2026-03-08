@@ -1,10 +1,14 @@
 """
 Bot Flow – logica conversazionale completa.
-Porta di peso tutto il flusso dal vecchio monolite, modularizzato.
 
 Flusso: WELCOME → SERVICES → OPERATOR → PERIOD → DAY_SELECT →
-        TIME_RANGE → TIME_SELECT → CONFIRM
+        TIME_RANGE → TIME_SELECT → CONFIRM → [NOTES] → booking
 + Gestione disdetta/spostamento con policy 24h
++ Blocco clienti indesiderati
++ Note prenotazione (booking_notes_prompt)
++ Anticipo minimo (min_advance_hours)
++ Limite slot globale (max_slots_per_half_hour)
++ Operatore nascondibile nei promemoria
 """
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ from services.session_service import get_session, save_session, clear_session
 from services.sheets_service import (
     get_services_for_shop,
     get_operators_for_shop,
+    is_customer_blocked,
 )
 from services.calendar_service import (
     load_hours_parsed,
@@ -44,14 +49,14 @@ from utils.helpers import (
 
 log = logging.getLogger(__name__)
 
-MAX_TIME_OPTIONS = 48  # default, sovrascritto da config
+MAX_TIME_OPTIONS = 48
 
 
 # ══════════════════════════════════════════════════════════════
-# MENU HELPERS
+# MENU HELPERS – tutte ricevono shop per credenziali WA
 # ══════════════════════════════════════════════════════════════
 
-def _send_services_menu(from_phone, shop, services, pid, picked_ids=None):
+def _send_services_menu(shop, from_phone, services, picked_ids=None):
     picked_ids = picked_ids or []
     rows = []
     for i, s in enumerate(services, 1):
@@ -60,51 +65,149 @@ def _send_services_menu(from_phone, shop, services, pid, picked_ids=None):
             continue
         rows.append((sid, s.get("name", f"Servizio {i}"), ""))
     if not rows:
-        send_text_message(from_phone, "Hai già selezionato tutti i servizi disponibili.", pid)
+        send_text_message(shop, from_phone, "Hai già selezionato tutti i servizi disponibili.")
         return
-    send_list_message(from_phone, "Scegli un servizio:", "Servizi", rows, pid)
+    send_list_message(shop, from_phone, "Scegli un servizio:", "Servizi", rows)
 
 
-def _send_days_menu(from_phone, days, pid):
+def _send_days_menu(shop, from_phone, days):
     rows = []
     for d in days:
         rid = f"day_{d.isoformat()}"
         wd = WEEKDAYS_IT[d.weekday()]
         title = f"{wd} {d.strftime('%d/%m')}"
         rows.append((rid, title, ""))
-    send_list_message(from_phone, "Scegli il giorno:", "Giorni", rows, pid)
+    send_list_message(shop, from_phone, "Scegli il giorno:", "Giorni", rows)
 
 
-def _send_times_menu(from_phone, slots, pid, show_operator=True):
+def _send_times_menu(shop, from_phone, slots, show_operator=True):
     max_opts = current_app.config.get("MAX_TIME_OPTIONS", MAX_TIME_OPTIONS)
     if not slots:
-        send_text_message(from_phone, "Nessun orario libero per questo giorno.", pid)
+        send_text_message(shop, from_phone, "Nessun orario libero per questo giorno.")
         send_interactive_buttons(
-            from_phone, "Cosa vuoi fare?",
-            [{"id": "ACT_BACK_DAY", "title": "Cambia giorno"}], pid,
+            shop, from_phone, "Cosa vuoi fare?",
+            [{"id": "ACT_BACK_DAY", "title": "Cambia giorno"}],
         )
         return
-
     rows = []
     for st, op in slots[:max_opts]:
         rid = f"slot_{st.isoformat()}"
         title = st.strftime("%H:%M")
         desc = f"con {op.get('operator_name', 'Operatore')}" if show_operator else ""
         rows.append((rid, title, desc))
-    send_list_message(from_phone, "Scegli l'orario:", "Orari", rows, pid)
+    send_list_message(shop, from_phone, "Scegli l'orario:", "Orari", rows)
     send_interactive_buttons(
-        from_phone, "Se non trovi l'orario, cambia giorno:",
-        [{"id": "ACT_BACK_DAY", "title": "Cambia giorno"}], pid,
+        shop, from_phone, "Se non trovi l'orario, cambia giorno:",
+        [{"id": "ACT_BACK_DAY", "title": "Cambia giorno"}],
     )
 
 
-def _send_period_buttons(from_phone, pid):
+def _send_period_buttons(shop, from_phone):
     buttons = [
         {"id": "period_0_10", "title": "📆 Prossimi 10 gg"},
         {"id": "period_10_20", "title": "📆 Da 10 a 20 gg"},
         {"id": "period_20_30", "title": "📆 Da 20 a 30 gg"},
     ]
-    send_interactive_buttons(from_phone, "Quando preferisci venire?", buttons, pid)
+    send_interactive_buttons(shop, from_phone, "Quando preferisci venire?", buttons)
+
+
+def _filter_min_advance(shop, slots, tz):
+    """Rimuove slot troppo vicini nel tempo (min_advance_hours)."""
+    min_adv = parse_int(str(shop.get("min_advance_hours", "")), 0)
+    if min_adv <= 0:
+        return slots
+    cutoff = dt.datetime.now(tz) + dt.timedelta(hours=min_adv)
+    return [(s, o) for s, o in slots if s >= cutoff]
+
+
+def _build_event_summary(shop, sess):
+    """Costruisce il titolo dell'evento Calendar dal formato del negozio."""
+    fmt = (shop.get("booking_title_format") or "").strip()
+    if not fmt:
+        fmt = "{customer_name} – {service}"
+    try:
+        return fmt.format(
+            customer_name=sess.get("customer_name", "Cliente"),
+            service=" + ".join(sess.get("picked_names") or []),
+            note=sess.get("booking_notes", ""),
+            phone=norm_phone(sess.get("_from_phone", "")),
+        ).strip()
+    except (KeyError, ValueError):
+        return f"{sess.get('customer_name', 'Cliente')} – {' + '.join(sess.get('picked_names') or [])}"
+
+
+def _do_booking(shop, from_phone, sess, operators, tz, phone_number_id, key):
+    """Esegue la prenotazione effettiva (creazione evento Calendar)."""
+    shop_id = shop.get("id", "")
+    start = dt.datetime.fromisoformat(sess["pending_start"])
+    op = sess["pending_operator"]
+    end = start + dt.timedelta(minutes=sess.get("picked_total_min", 30))
+
+    if sess.get("reschedule_target"):
+        delete_event(
+            sess["reschedule_target"]["calendar_id"],
+            sess["reschedule_target"]["event_id"],
+        )
+
+    services_txt = " + ".join(sess.get("picked_names") or []) or "Servizio"
+    summary = _build_event_summary(shop, sess)
+
+    event_id = create_booking_event(
+        op["calendar_id"],
+        start, end,
+        services_txt,
+        sess.get("customer_name", "Cliente"),
+        from_phone,
+        shop.get("name", ""),
+        op.get("operator_name", ""),
+        uuid.uuid4().hex[:8],
+        booking_key(shop_id, from_phone, services_txt, start),
+        summary_override=summary,
+        booking_notes=sess.get("booking_notes", ""),
+    )
+
+    try:
+        from services.customer_service import update_customer_after_booking
+        update_customer_after_booking(
+            from_phone, shop_id, services_txt, start,
+            customer_name=sess.get("customer_name"),
+            last_seen_phone_number_id=phone_number_id,
+        )
+    except Exception as e:
+        log.warning("update_customer_after_booking failed: %s", e)
+
+    when_txt = start.astimezone(tz).strftime("%d/%m/%Y %H:%M")
+
+    if sess.get("reschedule_target"):
+        msg_cliente = "🔁 Appuntamento spostato correttamente!"
+        msg_owner = (
+            f"🔁 Spostato\nCliente: {sess.get('customer_name', from_phone)}"
+            f"\nQuando: {when_txt}\nServizio: {services_txt}"
+        )
+    else:
+        msg_cliente = "Appuntamento confermato!"
+        msg_owner = (
+            f"Nuovo appuntamento\nCliente: {sess.get('customer_name', from_phone)}"
+            f"\nQuando: {when_txt}\nServizio: {services_txt}"
+        )
+
+    if sess.get("booking_notes"):
+        msg_owner += f"\nNote: {sess['booking_notes']}"
+
+    notify_owner(shop, msg_owner)
+    clear_session(key)
+
+    send_text_message(
+        shop, from_phone,
+        f"{msg_cliente}\n"
+        f"• Servizio: *{services_txt}*\n"
+        f"• Quando: *{when_txt}*\n\n"
+        "Puoi disdire o spostare *fino a 24 ore prima*.",
+    )
+    send_interactive_buttons(
+        shop, from_phone, "Gestisci l'appuntamento:",
+        [{"id": "ACT_RESCHEDULE", "title": "Sposta"}, {"id": "ACT_CANCEL", "title": "Disdici"}],
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -123,10 +226,23 @@ def handle_bot(
     key = f"{shop_id}:{norm_phone(from_phone)}"
     tz = shop_tz(shop)
 
+    # ── CLIENTE BLOCCATO ─────────────────────────────────────
+    blocked, blocked_msg = is_customer_blocked(shop_id, from_phone)
+    if blocked:
+        msg = blocked_msg or (shop.get("blocked_message") or "").strip()
+        if not msg:
+            msg = "Mi dispiace, al momento non è possibile effettuare prenotazioni."
+        send_text_message(shop, from_phone, msg)
+        return
+
     services = get_services_for_shop(shop_id)
     hours = load_hours_parsed(shop_id)
     operators = get_operators_for_shop(shop_id)
-    slot_minutes = parse_int(str(shop.get("slot_minutes", "")), current_app.config.get("DEFAULT_SLOT_MINUTES", 30))
+    slot_minutes = parse_int(
+        str(shop.get("slot_minutes", "")),
+        current_app.config.get("DEFAULT_SLOT_MINUTES", 30),
+    )
+    max_concurrent = parse_int(str(shop.get("max_slots_per_half_hour", "")), 0)
 
     sess = get_session(key)
     if not sess:
@@ -139,42 +255,40 @@ def handle_bot(
         }
     if contact_name:
         sess["customer_name"] = contact_name
+    sess["_from_phone"] = from_phone
     low = safe_lower(incoming_text)
 
     # ══════════════════════════════════════════════════════════
-    # CANCEL / RESCHEDULE (globale, intercettato prima dello state)
+    # CANCEL / RESCHEDULE
     # ══════════════════════════════════════════════════════════
     if interactive_id in {"ACT_CANCEL", "ACT_RESCHEDULE"} or "disd" in low or "sposta" in low:
         found = find_upcoming_customer_event(operators, from_phone, tz)
         if not found:
-            send_text_message(from_phone, "Non vedo appuntamenti futuri.", phone_number_id)
+            send_text_message(shop, from_phone, "Non vedo appuntamenti futuri.")
             return
         cal_id, ev_id, ev = found
         if not can_change_booking(ev, tz):
             owner_phone = norm_phone(shop.get("owner_phone", "") or "") or shop.get("name", "il negozio")
             send_text_message(
-                from_phone,
+                shop, from_phone,
                 f"⚠️ Mancano meno di 24 ore al tuo appuntamento.\n"
                 f"Per modifiche, contatta il negozio: {owner_phone}",
-                phone_number_id,
             )
             notify_owner(
                 shop,
                 f"⚠️ Cliente {contact_name or from_phone} ha tentato modifica <24h.",
-                phone_number_id,
             )
             return
 
         if interactive_id == "ACT_CANCEL" or "disd" in low:
             delete_event(cal_id, ev_id)
             clear_session(key)
-            send_text_message(from_phone, "❌ Appuntamento annullato correttamente.", phone_number_id)
-            notify_owner(shop, f"❌ Annullato\nCliente: {contact_name or from_phone}", phone_number_id)
+            send_text_message(shop, from_phone, "❌ Appuntamento annullato correttamente.")
+            notify_owner(shop, f"❌ Annullato\nCliente: {contact_name or from_phone}")
             return
 
         if interactive_id == "ACT_RESCHEDULE" or "sposta" in low:
             sess["reschedule_target"] = {"calendar_id": cal_id, "event_id": ev_id}
-            # Ripristina servizio e durata dall'evento
             ev_priv = ((ev.get("extendedProperties") or {}).get("private") or {})
             svc_name = norm_text(ev_priv.get("service") or ev.get("summary") or "")
             if "–" in svc_name:
@@ -185,7 +299,6 @@ def handle_bot(
             if not svc_name:
                 svc_name = "Servizio"
 
-            # Durata dall'evento
             st_str = (ev.get("start") or {}).get("dateTime")
             en_str = (ev.get("end") or {}).get("dateTime")
             dur_min = slot_minutes
@@ -197,7 +310,6 @@ def handle_bot(
             except Exception:
                 pass
 
-            # Prova ad agganciare l'operatore dell'evento esistente
             ev_op_name = ev_priv.get("operator", "")
             picked_idx = None
             if ev_op_name:
@@ -218,7 +330,7 @@ def handle_bot(
             sess["picked_total_min"] = dur_min
             sess["state"] = "PERIOD"
             save_session(key, sess)
-            _send_period_buttons(from_phone, phone_number_id)
+            _send_period_buttons(shop, from_phone)
             return
 
     # ══════════════════════════════════════════════════════════
@@ -235,11 +347,11 @@ def handle_bot(
                 {"id": "ACT_INFO", "title": "ℹ️ Info negozio"},
             ]
             send_interactive_buttons(
-                from_phone,
+                shop, from_phone,
                 f"👋 Benvenuto da {shop.get('name', 'il nostro salone')}\n"
                 "Posso aiutarti a prenotare un appuntamento in pochi secondi.\n"
                 "Da dove vuoi iniziare?",
-                buttons, phone_number_id,
+                buttons,
             )
             save_session(key, sess)
             return
@@ -247,7 +359,7 @@ def handle_bot(
         if interactive_id == "ACT_BOOK":
             sess["state"] = "SERVICES"
             save_session(key, sess)
-            _send_services_menu(from_phone, shop, services, phone_number_id, sess.get("picked"))
+            _send_services_menu(shop, from_phone, services, sess.get("picked"))
             return
 
         if interactive_id == "ACT_MANAGE":
@@ -262,28 +374,30 @@ def handle_bot(
                     except Exception:
                         pass
                 ep = (ev.get("extendedProperties") or {}).get("private") or {}
-                op_name = ep.get("operator", "Operatore")
                 svc = ep.get("service", "Servizio")
+                show_op = str(shop.get("show_operator_in_reminder", "TRUE")).strip().upper() != "FALSE"
+                op_line = ""
+                if show_op and ep.get("operator"):
+                    op_line = f"\n• Operatore: {ep['operator']}"
+
                 send_text_message(
-                    from_phone,
-                    f"📝 Hai un appuntamento:\n• Servizio: {svc}\n• Quando: {when_txt}\n• Operatore: {op_name}",
-                    phone_number_id,
+                    shop, from_phone,
+                    f"📝 Hai un appuntamento:\n• Servizio: {svc}\n• Quando: {when_txt}{op_line}",
                 )
                 send_interactive_buttons(
-                    from_phone, "Cosa vuoi fare?",
+                    shop, from_phone, "Cosa vuoi fare?",
                     [{"id": "ACT_RESCHEDULE", "title": "Sposta"}, {"id": "ACT_CANCEL", "title": "❌ Disdici"}],
-                    phone_number_id,
                 )
                 return
             else:
-                send_text_message(from_phone, "Non hai appuntamenti futuri.", phone_number_id)
+                send_text_message(shop, from_phone, "Non hai appuntamenti futuri.")
                 sess["state"] = "WELCOME"
                 save_session(key, sess)
                 return
 
         if interactive_id == "ACT_INFO":
             info = norm_text(shop.get("info")) or "Qui puoi inserire informazioni sul negozio."
-            send_text_message(from_phone, info, phone_number_id)
+            send_text_message(shop, from_phone, info)
             sess["state"] = "WELCOME"
             save_session(key, sess)
             return
@@ -292,7 +406,7 @@ def handle_bot(
     if interactive_id == "ACT_BACK_DAY":
         sess["state"] = "PERIOD"
         save_session(key, sess)
-        _send_period_buttons(from_phone, phone_number_id)
+        _send_period_buttons(shop, from_phone)
         return
 
     # ── SERVICES ─────────────────────────────────────────────
@@ -300,7 +414,7 @@ def handle_bot(
         if interactive_id == "ACT_ADD":
             sess["state"] = "SERVICES"
             save_session(key, sess)
-            _send_services_menu(from_phone, shop, services, phone_number_id, sess.get("picked"))
+            _send_services_menu(shop, from_phone, services, sess.get("picked"))
             return
 
         if interactive_id == "ACT_CHANGE":
@@ -309,27 +423,25 @@ def handle_bot(
             sess["picked_total_min"] = 0
             sess["state"] = "SERVICES"
             save_session(key, sess)
-            send_text_message(from_phone, "Ok, scegli di nuovo il servizio:", phone_number_id)
-            _send_services_menu(from_phone, shop, services, phone_number_id)
+            send_text_message(shop, from_phone, "Ok, scegli di nuovo il servizio:")
+            _send_services_menu(shop, from_phone, services)
             return
 
         if interactive_id == "ACT_NEXT":
             if not sess.get("picked_names"):
-                send_text_message(from_phone, "Prima scegli almeno un servizio.", phone_number_id)
-                _send_services_menu(from_phone, shop, services, phone_number_id, sess.get("picked"))
+                send_text_message(shop, from_phone, "Prima scegli almeno un servizio.")
+                _send_services_menu(shop, from_phone, services, sess.get("picked"))
                 return
 
             if not operators:
                 send_text_message(
-                    from_phone,
+                    shop, from_phone,
                     "Al momento non ci sono operatori configurati. Contatta direttamente il negozio.",
-                    phone_number_id,
                 )
                 sess["state"] = "WELCOME"
                 save_session(key, sess)
                 return
 
-            # Controlla se ci sono operatori attivi per scelta utente
             active_ops = [op for op in operators if op.get("active", True)]
             if active_ops and len(active_ops) > 1:
                 sess["state"] = "OPERATOR"
@@ -339,12 +451,11 @@ def handle_bot(
                     for i, op in enumerate(operators)
                 ]
                 op_buttons.append({"id": "op_any", "title": "👤 Chiunque"})
-                # Max 3 bottoni → se > 3, usa lista
                 if len(op_buttons) <= 3:
-                    send_interactive_buttons(from_phone, "Con chi preferisci?", op_buttons, phone_number_id)
+                    send_interactive_buttons(shop, from_phone, "Con chi preferisci?", op_buttons)
                 else:
                     rows = [(b["id"], b["title"], "") for b in op_buttons]
-                    send_list_message(from_phone, "Con chi preferisci?", "Operatori", rows, phone_number_id)
+                    send_list_message(shop, from_phone, "Con chi preferisci?", "Operatori", rows)
                 return
             elif active_ops and len(active_ops) == 1:
                 sess["picked_operator"] = 0
@@ -354,17 +465,16 @@ def handle_bot(
 
             sess["state"] = "PERIOD"
             save_session(key, sess)
-            _send_period_buttons(from_phone, phone_number_id)
+            _send_period_buttons(shop, from_phone)
             return
 
-        # Selezione servizio dalla lista
         if interactive_id and interactive_id.startswith("svc_"):
             try:
                 idx = int(interactive_id.split("_")[1])
             except (ValueError, IndexError):
                 return
             if idx < 1 or idx > len(services):
-                send_text_message(from_phone, "Servizio non valido.", phone_number_id)
+                send_text_message(shop, from_phone, "Servizio non valido.")
                 return
 
             svc = services[idx - 1]
@@ -374,18 +484,17 @@ def handle_bot(
             save_session(key, sess)
 
             send_interactive_buttons(
-                from_phone,
+                shop, from_phone,
                 f"Hai scelto *{svc.get('name')}*\nCosa vuoi fare?",
                 [
                     {"id": "ACT_ADD", "title": "Aggiungi"},
                     {"id": "ACT_CHANGE", "title": "Cambia"},
                     {"id": "ACT_NEXT", "title": "Prosegui"},
                 ],
-                phone_number_id,
             )
             return
 
-        _send_services_menu(from_phone, shop, services, phone_number_id, sess.get("picked"))
+        _send_services_menu(shop, from_phone, services, sess.get("picked"))
         return
 
     # ── OPERATOR ─────────────────────────────────────────────
@@ -399,13 +508,13 @@ def handle_bot(
                 except (ValueError, IndexError):
                     return
                 if idx < 0 or idx >= len(operators):
-                    send_text_message(from_phone, "Operatore non valido.", phone_number_id)
+                    send_text_message(shop, from_phone, "Operatore non valido.")
                     return
                 sess["picked_operator"] = idx
 
             sess["state"] = "PERIOD"
             save_session(key, sess)
-            _send_period_buttons(from_phone, phone_number_id)
+            _send_period_buttons(shop, from_phone)
             return
 
     # ── PERIOD ───────────────────────────────────────────────
@@ -423,12 +532,19 @@ def handle_bot(
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
 
-            days = list_available_days(hours, op_list, base_day, dur, slot_minutes, tz, min(10, end_off - start_off))
+            days = list_available_days(
+                hours, op_list, base_day, dur, slot_minutes, tz,
+                min(10, end_off - start_off),
+                max_concurrent=max_concurrent, all_operators=operators,
+            )
             if not days:
-                send_text_message(from_phone, "Non trovo disponibilità in questo periodo. Prova un altro intervallo.", phone_number_id)
+                send_text_message(
+                    shop, from_phone,
+                    "Non trovo disponibilità in questo periodo. Prova un altro intervallo.",
+                )
                 return
 
-            _send_days_menu(from_phone, days, phone_number_id)
+            _send_days_menu(shop, from_phone, days)
             sess["state"] = "DAY_SELECT"
             save_session(key, sess)
             return
@@ -442,18 +558,17 @@ def handle_bot(
             sess.pop("reschedule_target", None)
             sess["state"] = "SERVICES"
             save_session(key, sess)
-            send_text_message(from_phone, "Ok, scegli di nuovo il servizio:", phone_number_id)
-            _send_services_menu(from_phone, shop, services, phone_number_id)
+            send_text_message(shop, from_phone, "Ok, scegli di nuovo il servizio:")
+            _send_services_menu(shop, from_phone, services)
             return
 
-        _send_period_buttons(from_phone, phone_number_id)
+        _send_period_buttons(shop, from_phone)
         sess["state"] = "PERIOD"
         save_session(key, sess)
         return
 
     # ── DAY_SELECT ───────────────────────────────────────────
     if state == "DAY_SELECT":
-        # Permetti cambio periodo anche da DAY_SELECT
         if interactive_id and interactive_id.startswith("period_"):
             parts = interactive_id.split("_")
             try:
@@ -465,11 +580,15 @@ def handle_bot(
             base_day = dt.datetime.now(tz).date() + dt.timedelta(days=start_off)
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
-            days = list_available_days(hours, op_list, base_day, dur, slot_minutes, tz, min(10, end_off - start_off))
+            days = list_available_days(
+                hours, op_list, base_day, dur, slot_minutes, tz,
+                min(10, end_off - start_off),
+                max_concurrent=max_concurrent, all_operators=operators,
+            )
             if not days:
-                send_text_message(from_phone, "Non trovo disponibilità.", phone_number_id)
+                send_text_message(shop, from_phone, "Non trovo disponibilità.")
                 return
-            _send_days_menu(from_phone, days, phone_number_id)
+            _send_days_menu(shop, from_phone, days)
             save_session(key, sess)
             return
 
@@ -482,14 +601,18 @@ def handle_bot(
             try:
                 day = dt.date.fromisoformat(day_str)
             except ValueError:
-                send_text_message(from_phone, "Data non valida.", phone_number_id)
+                send_text_message(shop, from_phone, "Data non valida.")
                 return
 
             ranges = hours.get(day.weekday(), []) or []
             dur = int(sess.get("picked_total_min") or 30)
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
-            all_slots = list_free_slots_for_day(hours, op_list, day, dur, slot_minutes, tz, MAX_TIME_OPTIONS)
+            all_slots = list_free_slots_for_day(
+                hours, op_list, day, dur, slot_minutes, tz, MAX_TIME_OPTIONS,
+                max_concurrent=max_concurrent, all_operators=operators,
+            )
+            all_slots = _filter_min_advance(shop, all_slots, tz)
 
             if not ranges:
                 time_buttons = [
@@ -524,23 +647,23 @@ def handle_bot(
                             break
 
                 if not time_buttons:
-                    send_text_message(from_phone, "Nessuna fascia disponibile. Scegli un altro giorno.", phone_number_id)
+                    send_text_message(shop, from_phone, "Nessuna fascia disponibile. Scegli un altro giorno.")
                     send_interactive_buttons(
-                        from_phone, "Cosa vuoi fare?",
-                        [{"id": "ACT_BACK_DAY", "title": "Cambia giorno"}], phone_number_id,
+                        shop, from_phone, "Cosa vuoi fare?",
+                        [{"id": "ACT_BACK_DAY", "title": "Cambia giorno"}],
                     )
                     return
 
-            send_interactive_buttons(from_phone, "In che fascia oraria preferisci?", time_buttons[:3], phone_number_id)
+            send_interactive_buttons(shop, from_phone, "In che fascia oraria preferisci?", time_buttons[:3])
             return
 
-    # ── TIME_RANGE + TIME_SELECT (fascia → slot) ─────────────
+    # ── TIME_RANGE + TIME_SELECT ─────────────────────────────
     if state in ("TIME_RANGE", "TIME_SELECT"):
         if interactive_id and interactive_id.startswith("fascia_"):
             try:
                 day = dt.date.fromisoformat(sess.get("day", ""))
             except ValueError:
-                send_text_message(from_phone, "Errore sessione. Scrivi qualcosa per ricominciare.", phone_number_id)
+                send_text_message(shop, from_phone, "Errore sessione. Scrivi qualcosa per ricominciare.")
                 clear_session(key)
                 return
 
@@ -570,24 +693,30 @@ def handle_bot(
 
             picked_op = sess.get("picked_operator")
             op_list = operators if picked_op is None else [operators[picked_op]]
+            raw_slots = list_free_slots_for_day(
+                hours, op_list, day, dur, slot_minutes, tz, MAX_TIME_OPTIONS,
+                max_concurrent=max_concurrent, all_operators=operators,
+            )
+            raw_slots = _filter_min_advance(shop, raw_slots, tz)
+
             slots = []
-            for st_slot, op in list_free_slots_for_day(hours, op_list, day, dur, slot_minutes, tz, MAX_TIME_OPTIONS):
+            for st_slot, op in raw_slots:
                 st_min = st_slot.hour * 60 + st_slot.minute
                 if start_min <= st_min <= end_min - dur:
                     slots.append((st_slot, op))
 
             if not slots:
-                send_text_message(from_phone, "Nessun orario libero in questa fascia.", phone_number_id)
+                send_text_message(shop, from_phone, "Nessun orario libero in questa fascia.")
                 send_interactive_buttons(
-                    from_phone, "Cosa vuoi fare?",
-                    [{"id": "ACT_BACK_DAY", "title": "Cambia giorno"}], phone_number_id,
+                    shop, from_phone, "Cosa vuoi fare?",
+                    [{"id": "ACT_BACK_DAY", "title": "Cambia giorno"}],
                 )
                 return
 
             auto_assign = bool(sess.get("auto_assign_operator"))
             is_reschedule = bool(sess.get("reschedule_target"))
             show_operator = not (auto_assign or is_reschedule)
-            _send_times_menu(from_phone, slots, phone_number_id, show_operator=show_operator)
+            _send_times_menu(shop, from_phone, slots, show_operator=show_operator)
             sess["state"] = "TIME_SELECT"
             save_session(key, sess)
             return
@@ -601,7 +730,7 @@ def handle_bot(
             op_list = operators if picked_op is None else [operators[picked_op]]
             op = find_free_operator_for_slot(op_list, start, end, tz)
             if not op:
-                send_text_message(from_phone, "⚠️ L'orario non è più disponibile. Scegli un altro.", phone_number_id)
+                send_text_message(shop, from_phone, "⚠️ L'orario non è più disponibile. Scegli un altro.")
                 return
 
             sess["pending_start"] = start.isoformat()
@@ -610,86 +739,38 @@ def handle_bot(
             save_session(key, sess)
 
             services_txt = " + ".join(sess.get("picked_names") or []) or "Servizio"
+            show_op = str(shop.get("show_operator_in_reminder", "TRUE")).strip().upper() != "FALSE"
+            op_line = ""
+            if show_op:
+                op_line = f"\n• Operatore: *{op.get('operator_name', '')}*"
+
             send_interactive_buttons(
-                from_phone,
+                shop, from_phone,
                 "Riepilogo appuntamento:\n"
                 f"• Servizio: *{services_txt}*\n"
-                f"• Quando: *{start.astimezone(tz).strftime('%d/%m/%Y %H:%M')}*\n\n"
+                f"• Quando: *{start.astimezone(tz).strftime('%d/%m/%Y %H:%M')}*"
+                f"{op_line}\n\n"
                 "Confermi?",
                 [{"id": "ACT_BOOK", "title": "Prenota"}, {"id": "ACT_CHANGE", "title": "Cambia"}],
-                phone_number_id,
             )
             return
 
         if interactive_id == "ACT_BACK_DAY":
             sess["state"] = "PERIOD"
             save_session(key, sess)
-            _send_period_buttons(from_phone, phone_number_id)
+            _send_period_buttons(shop, from_phone)
             return
 
     # ── CONFIRM ──────────────────────────────────────────────
     if state == "CONFIRM":
         if interactive_id == "ACT_BOOK":
-            start = dt.datetime.fromisoformat(sess["pending_start"])
-            op = sess["pending_operator"]
-            end = start + dt.timedelta(minutes=sess.get("picked_total_min", 30))
-
-            if sess.get("reschedule_target"):
-                delete_event(
-                    sess["reschedule_target"]["calendar_id"],
-                    sess["reschedule_target"]["event_id"],
-                )
-
-            event_id = create_booking_event(
-                op["calendar_id"],
-                start, end,
-                " + ".join(sess["picked_names"]),
-                sess.get("customer_name", "Cliente"),
-                from_phone,
-                shop.get("name", ""),
-                op.get("operator_name", ""),
-                uuid.uuid4().hex[:8],
-                booking_key(shop_id, from_phone, " + ".join(sess["picked_names"]), start),
-            )
-
-            try:
-                from services.customer_service import update_customer_after_booking
-                update_customer_after_booking(
-                    from_phone, shop_id,
-                    " + ".join(sess["picked_names"]),
-                    start,
-                    customer_name=sess.get("customer_name"),
-                    last_seen_phone_number_id=phone_number_id,
-                )
-            except Exception as e:
-                log.warning("update_customer_after_booking failed: %s", e)
-
-            services_txt = " + ".join(sess.get("picked_names") or []) or "Servizio"
-            when_txt = start.astimezone(tz).strftime("%d/%m/%Y %H:%M")
-
-            if sess.get("reschedule_target"):
-                msg_cliente = "🔁 Appuntamento spostato correttamente!"
-                msg_owner = f"🔁 Spostato\nCliente: {sess.get('customer_name', from_phone)}\nQuando: {when_txt}\nServizio: {services_txt}"
-            else:
-                msg_cliente = "Appuntamento confermato!"
-                msg_owner = f"Nuovo appuntamento\nCliente: {sess.get('customer_name', from_phone)}\nQuando: {when_txt}\nServizio: {services_txt}"
-
-            notify_owner(shop, msg_owner, phone_number_id)
-            clear_session(key)
-
-            send_text_message(
-                from_phone,
-                f"{msg_cliente}\n"
-                f"• Servizio: *{services_txt}*\n"
-                f"• Quando: *{when_txt}*\n\n"
-                "Puoi disdire o spostare *fino a 24 ore prima*.",
-                phone_number_id,
-            )
-            send_interactive_buttons(
-                from_phone, "Gestisci l'appuntamento:",
-                [{"id": "ACT_RESCHEDULE", "title": "Sposta"}, {"id": "ACT_CANCEL", "title": "Disdici"}],
-                phone_number_id,
-            )
+            notes_prompt = (shop.get("booking_notes_prompt") or "").strip()
+            if notes_prompt and not sess.get("booking_notes"):
+                sess["state"] = "NOTES"
+                save_session(key, sess)
+                send_text_message(shop, from_phone, notes_prompt)
+                return
+            _do_booking(shop, from_phone, sess, operators, tz, phone_number_id, key)
             return
 
         if interactive_id == "ACT_CHANGE":
@@ -700,11 +781,23 @@ def handle_bot(
             sess.pop("pending_start", None)
             sess.pop("pending_operator", None)
             sess.pop("reschedule_target", None)
+            sess.pop("booking_notes", None)
             sess["state"] = "SERVICES"
             save_session(key, sess)
-            send_text_message(from_phone, "Ok, scegli di nuovo:", phone_number_id)
-            _send_services_menu(from_phone, shop, services, phone_number_id)
+            send_text_message(shop, from_phone, "Ok, scegli di nuovo:")
+            _send_services_menu(shop, from_phone, services)
             return
+
+    # ── NOTES (raccolta note prima del booking) ──────────────
+    if state == "NOTES":
+        if incoming_text:
+            sess["booking_notes"] = incoming_text
+            save_session(key, sess)
+            _do_booking(shop, from_phone, sess, operators, tz, phone_number_id, key)
+            return
+        prompt = (shop.get("booking_notes_prompt") or "Scrivi le note per l'appuntamento:").strip()
+        send_text_message(shop, from_phone, prompt)
+        return
 
     # ── Fallback: torna a WELCOME ────────────────────────────
     clear_session(key)

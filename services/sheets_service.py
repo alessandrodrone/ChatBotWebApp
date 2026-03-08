@@ -106,6 +106,7 @@ def get_all_shops() -> dict:
                     "whatsapp_number": str(row.get("whatsapp_number", "")),
                     "phone": str(row.get("whatsapp_number", "")),
                     "phone_number_id": str(row.get("phone_number_id", "")),
+                    "meta_access_token": str(row.get("meta_access_token", "")),
                     "owner_phone": str(row.get("owner_phone", "")),
                     "timezone": row.get("timezone", "Europe/Rome"),
                     "slot_minutes": int(row.get("slot_minutes", 30) or 30),
@@ -115,6 +116,16 @@ def get_all_shops() -> dict:
                     "description": row.get("description", ""),
                     "color": row.get("color", "#1a1a2e"),
                     "accent": row.get("accent", "#e94560"),
+                    # ── Nuove colonne per personalizzazione ──
+                    "owner_template_name": str(row.get("owner_template_name", "")),
+                    "owner_template_lang": str(row.get("owner_template_lang", "it")),
+                    "min_advance_hours": str(row.get("min_advance_hours", "")),
+                    "show_operator_in_reminder": str(row.get("show_operator_in_reminder", "TRUE")),
+                    "max_slots_per_half_hour": str(row.get("max_slots_per_half_hour", "")),
+                    "booking_notes_prompt": str(row.get("booking_notes_prompt", "")),
+                    "booking_title_format": str(row.get("booking_title_format", "")),
+                    "show_notes_to_customer": str(row.get("show_notes_to_customer", "FALSE")),
+                    "blocked_message": str(row.get("blocked_message", "")),
                 }
         return _shops_cache
     except Exception:
@@ -182,6 +193,7 @@ def get_all_operators() -> dict:
                 "priority": int(row.get("priority", 0) or 0),
                 "skills": row.get("skills", ""),
                 "gender": row.get("gender", ""),
+                "max_concurrent": int(row.get("max_concurrent", 1) or 1),
             }
             all_ops.setdefault(sid, []).append(op)
             if op["active"]:
@@ -290,6 +302,9 @@ def get_all_services() -> dict:
                 "price": str(row.get("price", "")),
                 "category": row.get("category", ""),
                 "active": True,
+                "work_phases": str(row.get("work_phases", "")),
+                "required_resources": str(row.get("required_resources", "")),
+                "max_per_slot": str(row.get("max_per_slot", "")),
             }
             _services_cache.setdefault(sid, []).append(svc)
 
@@ -423,3 +438,49 @@ def invalidate_customers_cache():
     """Invalida solo la cache customers."""
     global _customers_cache
     _customers_cache = None
+
+
+# ── Clienti bloccati ──────────────────────────────────────────
+_blocked_cache: list | None = None
+_blocked_ts: float = 0.0
+
+
+def get_blocked_customers(force: bool = False) -> list:
+    """Legge il foglio 'blocked_customers'. Cache 5 minuti."""
+    global _blocked_cache, _blocked_ts
+    import time as _time
+    if not force and _blocked_cache is not None and (_time.time() - _blocked_ts) < 300:
+        return _blocked_cache
+    try:
+        ss = _get_spreadsheet()
+        if ss is None:
+            return _blocked_cache or []
+        ws = ss.worksheet("blocked_customers")
+        rows = ws.get_all_records()
+        _blocked_cache = rows
+        _blocked_ts = _time.time()
+        return rows
+    except Exception as e:
+        log.warning("blocked_customers non trovato o errore: %s", e)
+        _blocked_cache = _blocked_cache or []
+        return _blocked_cache
+
+
+def is_customer_blocked(shop_id: str, phone: str) -> tuple[bool, str | None]:
+    """Verifica se un cliente è bloccato. Ritorna (blocked, messaggio_personalizzato)."""
+    import re as _re
+    blocked = get_blocked_customers()
+    norm = _re.sub(r"\D+", "", phone or "")
+    for b in blocked:
+        bsid = str(b.get("shop_id", "")).strip()
+        bphone = _re.sub(r"\D+", "", str(b.get("phone", "")))
+        if bsid == shop_id and bphone == norm:
+            custom_msg = str(b.get("message", "")).strip() or None
+            return True, custom_msg
+    return False, None
+
+
+def invalidate_blocked_cache():
+    """Invalida la cache dei clienti bloccati."""
+    global _blocked_cache
+    _blocked_cache = None

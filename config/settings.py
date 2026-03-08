@@ -40,6 +40,7 @@ class Config:
     SESSION_TTL_MINUTES = int(os.environ.get("SESSION_TTL_MINUTES", "45"))
     MAX_LOOKAHEAD_DAYS = int(os.environ.get("MAX_LOOKAHEAD_DAYS", "30"))
     DEFAULT_SLOT_MINUTES = int(os.environ.get("DEFAULT_SLOT_MINUTES", "30"))
+    DEFAULT_MIN_ADVANCE_HOURS = int(os.environ.get("DEFAULT_MIN_ADVANCE_HOURS", "0"))
     CUSTOMER_SHOP_TTL_DAYS = int(os.environ.get("CUSTOMER_SHOP_TTL_DAYS", "0"))  # 0 = per sempre
 
     # ── Blocchi agenda ────────────────────────────────────────

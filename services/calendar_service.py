@@ -139,6 +139,29 @@ def _find_free_operator_with_events(
     return None
 
 
+def _count_concurrent_events(
+    events_by_cal: Dict[str, List[Dict]], start: dt.datetime, end: dt.datetime
+) -> int:
+    """Conta eventi opachi sovrapposti a uno slot su TUTTI i calendari."""
+    count = 0
+    for events in events_by_cal.values():
+        for ev in events:
+            ev_start_str = (ev.get("start") or {}).get("dateTime")
+            ev_end_str = (ev.get("end") or {}).get("dateTime")
+            if not ev_start_str or not ev_end_str:
+                continue
+            try:
+                ev_start = dt.datetime.fromisoformat(ev_start_str)
+                ev_end = dt.datetime.fromisoformat(ev_end_str)
+            except Exception:
+                continue
+            if ev_start < end and ev_end > start:
+                if not _has_block_keyword(ev.get("summary", "")):
+                    if ev.get("transparency") != "transparent":
+                        count += 1
+    return count
+
+
 # ── API pubbliche ────────────────────────────────────────────
 
 def load_hours_parsed(shop_id: str) -> Dict[int, List[Tuple[dt.time, dt.time]]]:
@@ -193,22 +216,32 @@ def list_free_slots_for_day(
     tz: dt.tzinfo,
     limit: int,
     events_by_cal: Optional[Dict[str, List[Dict]]] = None,
+    *,
+    max_concurrent: int = 0,
+    all_operators: Optional[List[Dict]] = None,
 ) -> List[Tuple[dt.datetime, Dict]]:
     """
     Trova slot liberi per un giorno.
-    Se events_by_cal è fornito, usa eventi pre-caricati (veloce).
-    Altrimenti carica gli eventi al volo (1 chiamata API per operatore).
+    max_concurrent: limite globale appuntamenti per slot (0 = no limite).
+    all_operators: tutti gli operatori del negozio (per conteggio globale).
     """
     out: List[Tuple[dt.datetime, Dict]] = []
     ranges = hours.get(day.weekday(), []) or []
 
-    # Pre-carica eventi se non forniti (1 call per operatore)
+    # Pre-carica eventi
     if events_by_cal is None:
         events_by_cal = {}
+        # Carica per gli operatori da cercare
         for op in operators:
             cal_id = op.get("calendar_id")
             if cal_id and cal_id not in events_by_cal:
                 events_by_cal[cal_id] = _load_day_events(cal_id, day, tz)
+        # Se max_concurrent, carica anche per tutti gli altri operatori
+        if max_concurrent > 0 and all_operators:
+            for op in all_operators:
+                cal_id = op.get("calendar_id")
+                if cal_id and cal_id not in events_by_cal:
+                    events_by_cal[cal_id] = _load_day_events(cal_id, day, tz)
 
     for st, en in ranges:
         cur = dt.datetime.combine(day, st, tzinfo=tz)
@@ -217,6 +250,12 @@ def list_free_slots_for_day(
             end_dt = cur + dt.timedelta(minutes=dur_min)
             op = _find_free_operator_with_events(operators, events_by_cal, cur, end_dt)
             if op:
+                # Verifica limite globale
+                if max_concurrent > 0:
+                    total = _count_concurrent_events(events_by_cal, cur, end_dt)
+                    if total >= max_concurrent:
+                        cur += dt.timedelta(minutes=slot_minutes)
+                        continue
                 out.append((cur, op))
                 if len(out) >= limit:
                     return out
@@ -232,6 +271,9 @@ def list_available_days(
     slot_minutes: int,
     tz: dt.tzinfo,
     limit_days: int,
+    *,
+    max_concurrent: int = 0,
+    all_operators: Optional[List[Dict]] = None,
 ) -> List[dt.date]:
     """
     Trova giorni con almeno uno slot libero.
@@ -245,7 +287,10 @@ def list_available_days(
             continue
 
         events_by_cal: Dict[str, List[Dict]] = {}
-        for op in operators:
+        ops_to_load = list(operators)
+        if max_concurrent > 0 and all_operators:
+            ops_to_load = all_operators
+        for op in ops_to_load:
             cal_id = op.get("calendar_id")
             if cal_id and cal_id not in events_by_cal:
                 events_by_cal[cal_id] = _load_day_events(cal_id, day, tz)
@@ -253,6 +298,7 @@ def list_available_days(
         slots = list_free_slots_for_day(
             hours, operators, day, dur_min, slot_minutes,
             tz, limit=1, events_by_cal=events_by_cal,
+            max_concurrent=max_concurrent, all_operators=all_operators,
         )
         if slots:
             days.append(day)
@@ -285,6 +331,9 @@ def create_booking_event(
     operator_name: str,
     booking_id: str,
     booking_key: str,
+    *,
+    summary_override: str = "",
+    booking_notes: str = "",
 ) -> str:
     """Crea un evento di prenotazione su Google Calendar."""
     cal = _get_calendar_client()
@@ -292,17 +341,20 @@ def create_booking_event(
         log.error("Calendar client non disponibile – evento non creato")
         return ""
 
-    summary = f"{customer_name} – {service_name}".strip(" –")
-    description = "\n".join([
+    summary = summary_override or f"{customer_name} – {service_name}".strip(" –")
+    desc_parts = [
         f"Attività: {shop_name}",
         f"Operatore: {operator_name}",
         "",
         f"Cliente: {customer_name}",
         f"Telefono: {norm_phone(customer_phone)}",
         f"Servizio: {service_name}",
-        "",
-        f"Booking ID: {booking_id}",
-    ])
+    ]
+    if booking_notes:
+        desc_parts.append(f"Note: {booking_notes}")
+    desc_parts.append("")
+    desc_parts.append(f"Booking ID: {booking_id}")
+    description = "\n".join(desc_parts)
 
     body = {
         "summary": summary,
