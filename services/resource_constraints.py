@@ -16,7 +16,11 @@ def get_resource_constraints() -> dict:
     if _constraints_cache is not None:
         return _constraints_cache
     try:
-        ss = current_app.extensions["sheets_service"]._get_spreadsheet()
+        from services.sheets_service import _get_spreadsheet
+        ss = _get_spreadsheet()
+        if ss is None:
+            _constraints_cache = {}
+            return _constraints_cache
         ws = ss.worksheet("resource_constraints")
         records = ws.get_all_records()
         _constraints_cache = {}
