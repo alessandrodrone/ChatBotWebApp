@@ -347,7 +347,7 @@ def handle_bot(
         if not interactive_id:
             buttons = [
                 {"id": "ACT_BOOK", "title": "Prenota appuntamento"},
-                {"id": "ACT_MANAGE", "title": "Gestisci appuntamento"},
+                {"id": "ACT_MANAGE", "title": "I miei appuntamenti"},
                 {"id": "ACT_INFO", "title": "ℹ️ Info negozio"},
             ]
             send_interactive_buttons(
