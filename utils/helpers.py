@@ -81,7 +81,7 @@ def shop_tz(shop: dict) -> dt.tzinfo:
 # ── SHOP=... hint ─────────────────────────────────────────────
 
 def extract_shop_hint(text: str) -> Optional[str]:
-    m = re.search(r"\bSHOP\s*=\s*([A-Za-z0-9_\-]+)\b", text or "", flags=re.I)
+    m = re.search(r"\bSTART_([A-Za-z0-9_\-]+)\b", text or "", flags=re.I)
     return m.group(1) if m else None
 
 
