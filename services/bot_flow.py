@@ -785,7 +785,8 @@ def handle_bot(
     if state == "CONFIRM":
         if interactive_id == "ACT_BOOK":
             notes_prompt = (shop.get("booking_notes_prompt") or "").strip()
-            if notes_prompt and not sess.get("booking_notes"):
+            show_notes = str(shop.get("show_notes_to_customer", "FALSE")).strip().upper() == "TRUE"
+            if notes_prompt and not sess.get("booking_notes") and show_notes:
                 sess["state"] = "NOTES"
                 save_session(key, sess)
                 send_text_message(shop, from_phone, notes_prompt)
