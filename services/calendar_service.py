@@ -1,3 +1,4 @@
+from __future__ import annotations
 from services.resource_constraints import get_resource_constraints
 """
 Servizio Calendario – integrazione Google Calendar API.
@@ -9,7 +10,6 @@ OTTIMIZZAZIONI vs vecchio monolite:
 - Verifica slot con eventi pre-caricati (zero call aggiuntive)
 - Riuso credenziali cachate
 """
-from __future__ import annotations
 
 import json
 import logging
