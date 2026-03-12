@@ -1,3 +1,4 @@
+from services.resource_constraints import get_resource_constraints
 """
 Servizio Calendario – integrazione Google Calendar API.
 Gestisce: verifica disponibilità, creazione/cancellazione eventi,
@@ -244,7 +245,7 @@ def _find_free_operator_for_intervals(
 
 
 def _count_concurrent_events(
-    events_by_cal: Dict[str, List[Dict]], start: dt.datetime, end: dt.datetime
+    events_by_cal: Dict[str, List[Dict]], start: dt.datetime, end: dt.datetime, shop_id: str = "", required_resources: Optional[List[str]] = None
 ) -> int:
     """Conta eventi opachi sovrapposti a uno slot su TUTTI i calendari.
 
@@ -268,16 +269,25 @@ def _count_concurrent_events(
                     continue
                 if ev.get("transparency") == "transparent":
                     continue
-                # Work‑phases: conta solo se sovrappone una fase busy
                 ep = (ev.get("extendedProperties") or {}).get("private") or {}
                 ph_json = ep.get("work_phases", "")
+                ev_resources = ep.get("required_resources", "")
+                ev_resources_list = [r.strip().lower() for r in ev_resources.split(",") if r.strip()] if ev_resources else []
                 if ph_json:
                     phases = parse_work_phases(ph_json)
                     if phases:
                         if _ev_overlaps_busy(ev_start, phases, start, end):
-                            count += 1
+                            if required_resources:
+                                if any(r in ev_resources_list for r in required_resources):
+                                    count += 1
+                            else:
+                                count += 1
                         continue
-                count += 1
+                if required_resources:
+                    if any(r in ev_resources_list for r in required_resources):
+                        count += 1
+                else:
+                    count += 1
     return count
 
 
@@ -368,6 +378,10 @@ def list_free_slots_for_day(
         while cur + dt.timedelta(minutes=dur_min) <= end_limit:
             end_dt = cur + dt.timedelta(minutes=dur_min)
 
+            # Recupera shop_id e service
+            shop_id = operators[0].get("shop_id", "") if operators else ""
+            service = operators[0].get("service", {}) if operators and "service" in operators[0] else {}
+
             # ── Cerca operatore libero ──
             if work_phases:
                 busy_ivs = _get_busy_intervals(cur, work_phases)
@@ -380,19 +394,39 @@ def list_free_slots_for_day(
                 )
 
             if op:
+                # ── Verifica vincoli risorse ──
+                svc_resources = [r.strip().lower() for r in (service.get("required_resources", "") or "").split(",") if r.strip()]
+                constraints = get_resource_constraints()
+                shop_constraints = constraints.get(shop_id, {})
+                blocked = False
+                for res in svc_resources:
+                    maxc = shop_constraints.get(res, 0)
+                    if maxc > 0:
+                        used = 0
+                        if work_phases:
+                            for bi_s, bi_e in _get_busy_intervals(cur, work_phases):
+                                used += _count_concurrent_events(events_by_cal, bi_s, bi_e, shop_id, [res])
+                        else:
+                            used = _count_concurrent_events(events_by_cal, cur, end_dt, shop_id, [res])
+                        if used >= maxc:
+                            blocked = True
+                            break
+                if blocked:
+                    cur += dt.timedelta(minutes=slot_minutes)
+                    continue
                 # Verifica limite globale
                 if max_concurrent > 0:
                     if work_phases:
                         over = False
                         for bi_s, bi_e in _get_busy_intervals(cur, work_phases):
-                            if _count_concurrent_events(events_by_cal, bi_s, bi_e) >= max_concurrent:
+                            if _count_concurrent_events(events_by_cal, bi_s, bi_e, shop_id, svc_resources) >= max_concurrent:
                                 over = True
                                 break
                         if over:
                             cur += dt.timedelta(minutes=slot_minutes)
                             continue
                     else:
-                        total = _count_concurrent_events(events_by_cal, cur, end_dt)
+                        total = _count_concurrent_events(events_by_cal, cur, end_dt, shop_id, svc_resources)
                         if total >= max_concurrent:
                             cur += dt.timedelta(minutes=slot_minutes)
                             continue

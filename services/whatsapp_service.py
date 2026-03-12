@@ -128,29 +128,14 @@ def send_template_message(shop: dict, to: str, template_name: str,
 # ── Notifiche proprietario ────────────────────────────────────
 
 def notify_owner(shop: dict, message: str) -> None:
-    """Notifica il proprietario.
-
-    Se c'è un template configurato (owner_template_name) invia UN SOLO
-    messaggio template con i dettagli nella variabile {{content_1}}.
-    Altrimenti tenta un messaggio di testo (funziona solo nella finestra 24h).
-    """
+    """Notifica il proprietario inviando un messaggio di testo (senza template)."""
     if not current_app.config.get("ENABLE_OWNER_NOTIFY", True):
         return
     from utils.helpers import norm_phone
     owner = norm_phone(shop.get("owner_phone", "") or "")
     if not owner:
         return
-    template_name = (shop.get("owner_template_name") or "").strip()
-    template_lang = (shop.get("owner_template_lang") or "it").strip()
     try:
-        if template_name:
-            # Template con variabile {{content_1}} → dettagli nel body
-            components = [{
-                "type": "body",
-                "parameters": [{"type": "text", "text": message[:1024]}],
-            }]
-            send_template_message(shop, owner, template_name, template_lang, components)
-        else:
-            send_text_message(shop, owner, message)
+        send_text_message(shop, owner, message)
     except Exception as e:
         log.warning("Notifica owner fallita shop=%s: %s", shop.get("id"), e)
